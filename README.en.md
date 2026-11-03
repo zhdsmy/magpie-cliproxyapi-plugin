@@ -6,6 +6,8 @@ Connect CLIProxyAPI (CPA) models to Magpie, with optional credential quota queri
 
 The Claude path has been verified with Magpie 0.1.2790 / 0.1.2826 and CPA 8.0.51. The multi-provider extension has only been tested with mocks. Verify actual capabilities of non-Claude backends yourself.
 
+The plugin bundles the [router-for-me](https://github.com/router-for-me) organization avatar as its shared icon, resized to 128×128 and embedded in metadata so displaying it needs no extra network request.
+
 ## Install and sign in
 
 You need a working CPA backend, a business API key, and Magpie with provider plugin support. Magpie prepares Bun; the plugin has no external runtime dependencies.

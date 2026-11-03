@@ -6,6 +6,8 @@
 
 已验证 Magpie 0.1.2790 / 0.1.2826 与 CPA 8.0.51 的 Claude 链路。多供应商扩展仅经 mock 测试，非 Claude 后端的实际能力仍需自行验证。
 
+插件内置 [router-for-me](https://github.com/router-for-me) 组织头像作为统一图标，缩放为 128×128 并嵌入元数据，显示时无需额外网络请求。
+
 ## 安装与登录
 
 需有可用的 CPA 后端、业务 API key，以及支持 provider 插件的 Magpie。Magpie 会准备 Bun 运行时；插件本身没有外部运行时依赖。
