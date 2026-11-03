@@ -15,13 +15,16 @@
     "test": "node --test test/*.test.mjs"
   },
   "keywords": [
-    "opencode",
-    "opencode-plugin",
     "magpie-plugin",
     "cliproxyapi"
   ],
   "license": "MIT",
   "engines": {
     "node": ">=20"
+  },
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhdsmy/magpie-cliproxyapi-plugin.git"
   }
 }

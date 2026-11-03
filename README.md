@@ -4,20 +4,18 @@
 
 将 CLIProxyAPI（CPA）提供的模型接入 Magpie，并可选通过 CPA 管理接口查询凭据额度。目前额度适配器仅支持 Claude 的五小时、总周限已用百分比。无需额外 shim；OAuth 登录、Token 刷新和上游凭据选择均由 CPA 负责。
 
-当前为未发布的开发版本。Claude 链路已有隔离及真实环境验收；本次多供应商扩展仅经 mock 测试，非 Claude 后端的实际能力仍需自行验证。
+已验证 Magpie 0.1.2790 / 0.1.2826 与 CPA 8.0.51 的 Claude 链路。多供应商扩展仅经 mock 测试，非 Claude 后端的实际能力仍需自行验证。
 
 ## 安装与登录
 
 需有可用的 CPA 后端、业务 API key，以及支持 provider 插件的 Magpie。Magpie 会准备 Bun 运行时；插件本身没有外部运行时依赖。
 
 ```sh
-# 发布后使用实际包或 Git 地址替换占位符；目前没有可用的发布地址。
-magpie plugin add '<npm-or-git-spec>'
-
-# 开发时可直接安装本地目录。
-magpie plugin add /absolute/path/to/magpie-cliproxyapi-plugin
+magpie plugin add https://github.com/zhdsmy/magpie-cliproxyapi-plugin
 magpie plugin login cpa
 ```
+
+仅通过 GitHub 分发，不发布 npm 包。开发时可用 `magpie plugin add /absolute/path/to/magpie-cliproxyapi-plugin` 安装本地目录。
 
 Magpie 服务运行中执行登录后，请运行 `magpie plugin on <安装时使用的包名或路径>`（本地开发示例为 `magpie plugin on /absolute/path/to/magpie-cliproxyapi-plugin`），或重启 Magpie 服务，使新账号生效。
 

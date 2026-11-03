@@ -4,20 +4,18 @@
 
 Connect CLIProxyAPI (CPA) models to Magpie, with optional credential quota queries through CPA's management API. The current quota adapter supports Claude's five-hour and general weekly usage percentages. No extra shim is required. CPA handles OAuth sign-in, token refresh, and upstream credential selection.
 
-This development version has not been published. The Claude path has passed isolated and real-environment acceptance; this multi-provider extension has only been tested with mocks. Verify actual capabilities of non-Claude backends yourself.
+The Claude path has been verified with Magpie 0.1.2790 / 0.1.2826 and CPA 8.0.51. The multi-provider extension has only been tested with mocks. Verify actual capabilities of non-Claude backends yourself.
 
 ## Install and sign in
 
 You need a working CPA backend, a business API key, and Magpie with provider plugin support. Magpie prepares Bun; the plugin has no external runtime dependencies.
 
 ```sh
-# Replace the placeholder after publication; no published address is available yet.
-magpie plugin add '<npm-or-git-spec>'
-
-# For development, install a local directory instead.
-magpie plugin add /absolute/path/to/magpie-cliproxyapi-plugin
+magpie plugin add https://github.com/zhdsmy/magpie-cliproxyapi-plugin
 magpie plugin login cpa
 ```
+
+Distributed through GitHub only, with no npm package. For development, use `magpie plugin add /absolute/path/to/magpie-cliproxyapi-plugin` to install a local directory.
 
 After signing in while Magpie is running, run `magpie plugin on <installed package or path>` (for local development, `magpie plugin on /absolute/path/to/magpie-cliproxyapi-plugin`), or restart Magpie, to activate the new account.
 
