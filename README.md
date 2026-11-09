@@ -2,7 +2,7 @@
 
 [English](README.en.md)
 
-将 CLIProxyAPI（CPA）提供的模型接入 Magpie，并可选通过 CPA 管理接口查询凭据额度。目前额度适配器仅支持 Claude 的五小时、总周限已用百分比。无需额外 shim；OAuth 登录、Token 刷新和上游凭据选择均由 CPA 负责。
+将 CLIProxyAPI（CPA）提供的模型接入 Magpie，并可选通过 CPA 管理接口查询凭据额度和 Claude 思考等级。目前额度适配器仅支持 Claude 的五小时、总周限已用百分比。无需额外 shim；OAuth 登录、Token 刷新和上游凭据选择均由 CPA 负责。
 
 已验证 Magpie 0.1.2790 / 0.1.2826 与 CPA 8.0.51 的 Claude 链路。多供应商扩展仅经 mock 测试，非 Claude 后端的实际能力仍需自行验证。
 
@@ -26,7 +26,7 @@ Magpie 服务运行中执行登录后，请运行 `magpie plugin on <安装时�
 | 字段 | 含义 |
 | --- | --- |
 | CPA Base URL | 必填，例如 `https://cpa.example.invalid`。允许尾部 `/v1`，会自动去掉；不允许 URL 用户信息、query 或 fragment。 |
-| Management key | 可选，密码输入；不填仍可推理，但插件不查询额度。 |
+| Management key | 可选，密码输入；用于额度和 Claude 思考等级。不填仍可推理，但不查询管理接口，也不显示思考等级。 |
 | Management URL | 可选，**完整管理入口**，例如 `http://127.0.0.1:8317/v8/management`；默认 `<CPA Base URL>/v8/management`。 |
 | CPA credential | 可选，按 CPA 凭据的 `name` 或 `auth_index` 精确选择。 |
 | Business API key | Magpie 随后要求输入的 CPA 业务 key，用于模型发现与推理。 |
@@ -43,7 +43,7 @@ Magpie 服务运行中执行登录后，请运行 `magpie plugin on <安装时�
 
 CPA 只把其看到的 `127.0.0.1` / `::1` 视为本机。通常需要 Magpie 与 CPA 处于同一网络命名空间并使用回环地址；否则需由你开启 CPA `allow-remote`；建议配合来源防火墙、隧道或私网限制访问。同机不同 Docker 容器、私网或 Tailscale 地址通常仍算远程。插件不修改这些设置，**不建议公开管理接口到公网**。
 
-额度按所选上游**凭据账号**计算，不是按模型计算，也不代表整个 CPA 凭据池。适配器按管理接口返回的凭据 `provider` 分派；目前只有 `claude`，仅输出 `5 hours` / `7 days` 百分比、跨度和重置时间，不显示金额或账户资料。发现非 Claude 模型不代表支持其额度。
+额度按所选上游**凭据账号**计算，不是按模型计算，也不代表整个 CPA 凭据池。适配器按管理接口返回的凭据 `provider` 分派；目前只有 `claude`，仅输出 `5 hours` / `7 days` 百分比、跨度和重置时间，不显示金额或账户资料。管理接口还提供 Claude 频道的模型思考等级；插件把有等级定义的模型标为 reasoning 并显示等级。管理接口不可达、返回错误或没有管理 key 时，模型仍正常发现但不带等级。发现非 Claude 模型不代表支持其额度或思考等级。
 
 | 凭据选择 | 行为 |
 | --- | --- |

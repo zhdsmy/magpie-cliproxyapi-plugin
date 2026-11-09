@@ -21,6 +21,20 @@ function validateURL(value, optional = false) {
   try { normalizeURL(value); } catch (error) { return error.message; }
 }
 
+function managementBase(metadata) {
+  return metadata.managementURL ? normalizeURL(metadata.managementURL)
+    : normalizeURL(metadata.baseURL) + "/v8/management";
+}
+
+function managementHeaders(metadata) {
+  return { Authorization: "Bearer " + metadata.managementKey, "Content-Type": "application/json" };
+}
+
+function modelDefinitionsBase(metadata) {
+  return metadata.managementURL ? normalizeURL(metadata.managementURL)
+    : normalizeURL(metadata.baseURL) + "/v0/management";
+}
+
 async function readJSON(response, maxBytes) {
   const decoder = new TextDecoder();
   let bytes = 0;
@@ -94,8 +108,7 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
       const metadata = auth?.metadata;
       if (auth?.type !== "api" || !metadata?.managementKey) return {};
       if (typeof metadata.managementKey !== "string") throw new UsageError("Check the CPA management key");
-      const base = metadata.managementURL ? normalizeURL(metadata.managementURL)
-        : normalizeURL(metadata.baseURL) + "/v8/management";
+      const base = managementBase(metadata);
       const selection = metadata.credential ?? "";
       if (typeof selection !== "string") throw new UsageError("Check the CPA credential selection");
       const scope = base + "|" + createHash("sha256").update(metadata.managementKey).digest("hex").slice(0, 12);
@@ -109,7 +122,7 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
         signal.throwIfAborted();
         const response = await request(base + path, {
           method: body === undefined ? "GET" : "POST",
-          headers: { Authorization: "Bearer " + metadata.managementKey, "Content-Type": "application/json" },
+          headers: managementHeaders(metadata),
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           redirect: "error", signal,
         });
@@ -172,6 +185,55 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
       return { error: "CPA usage unavailable; check management configuration", signIn: "kept" };
     }
   };
+}
+
+function definitionBase(id) {
+  return id.replace(/\[1m\]$/i, "").replace(/-\d{8}$/, "");
+}
+
+function reasoningLevels(definition) {
+  if (!Array.isArray(definition?.thinking?.levels)) return [];
+  return [...new Set(definition.thinking.levels
+    .filter(level => typeof level === "string")
+    .map(level => level.trim())
+    .filter(Boolean))];
+}
+
+async function modelDefinitions(auth) {
+  const metadata = auth?.metadata;
+  if (typeof metadata?.managementKey !== "string" || !metadata.managementKey) return new Map();
+  try {
+    const signal = AbortSignal.timeout(10_000);
+    const response = await fetch(modelDefinitionsBase(metadata) + "/model-definitions/claude", {
+      headers: managementHeaders(metadata), signal, redirect: "error",
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      return new Map();
+    }
+    const payload = await readJSON(response, 1 << 20);
+    if (!Array.isArray(payload?.models)) return new Map();
+    const definitions = new Map();
+    for (const definition of payload.models) {
+      if (typeof definition?.id !== "string" || !definition.id.trim()) continue;
+      definitions.set(definition.id, definition);
+    }
+    return definitions;
+  } catch {
+    return new Map();
+  }
+}
+
+function applyReasoning(model, definition, configured) {
+  const levels = reasoningLevels(definition);
+  if (!levels.length) return model;
+  if (!Object.hasOwn(configured ?? {}, "variants")) {
+    model.variants = Object.fromEntries(levels.map(level => [level, {}]));
+  }
+  if (!Object.hasOwn(configured?.capabilities ?? {}, "reasoning")) {
+    model.capabilities = { ...model.capabilities, reasoning: true };
+  }
+  return model;
 }
 
 export default async function CLIProxyAPIPlugin() {
@@ -241,12 +303,16 @@ export default async function CLIProxyAPIPlugin() {
         if (!Array.isArray(payload?.data)) {
           throw new Error("Invalid CPA model list");
         }
+        const definitions = await modelDefinitions(auth);
         const models = {};
         for (const row of payload.data) {
           if (typeof row?.id !== "string" || !row.id.trim()) continue;
           if (row.id.startsWith("claude-fable-5-dd-")) continue;
-          const model = { ...provider?.models?.[row.id], id: row.id,
+          const configured = provider?.models?.[row.id];
+          const definition = definitions.get(row.id) ?? definitions.get(definitionBase(row.id));
+          const model = { ...configured, id: row.id,
             name: typeof row.display_name === "string" && row.display_name ? row.display_name : row.id };
+          applyReasoning(model, definition, configured);
           if (model.api) {
             const { id: _id, ...api } = model.api;
             model.api = api;

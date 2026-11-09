@@ -2,7 +2,7 @@
 
 [中文](README.md)
 
-Connect CLIProxyAPI (CPA) models to Magpie, with optional credential quota queries through CPA's management API. The current quota adapter supports Claude's five-hour and general weekly usage percentages. No extra shim is required. CPA handles OAuth sign-in, token refresh, and upstream credential selection.
+Connect CLIProxyAPI (CPA) models to Magpie, with optional credential quota and Claude reasoning-level queries through CPA's management API. The current quota adapter supports Claude's five-hour and general weekly usage percentages. No extra shim is required. CPA handles OAuth sign-in, token refresh, and upstream credential selection.
 
 The Claude path has been verified with Magpie 0.1.2790 / 0.1.2826 and CPA 8.0.51. The multi-provider extension has only been tested with mocks. Verify actual capabilities of non-Claude backends yourself.
 
@@ -24,7 +24,7 @@ After signing in while Magpie is running, run `magpie plugin on <installed packa
 | Field | Meaning |
 | --- | --- |
 | CPA Base URL | Required, e.g. `https://cpa.example.invalid`. A trailing `/v1` is removed. URL userinfo, query strings and fragments are rejected. |
-| Management key | Optional password input. Inference works without it; the plugin makes no quota requests. |
+| Management key | Optional password input for quota and Claude reasoning levels. Inference works without it; the plugin makes no management requests and shows no reasoning levels. |
 | Management URL | Optional **complete management endpoint**, e.g. `http://127.0.0.1:8317/v8/management`. Defaults to `<CPA Base URL>/v8/management`. |
 | CPA credential | Optional exact CPA credential `name` or `auth_index`. |
 | Business API key | The CPA business key requested next by Magpie, used for model discovery and inference. |
@@ -41,7 +41,7 @@ The management key grants **full CPA management access, not read-only quota acce
 
 CPA considers only client addresses `127.0.0.1` and `::1` local. Normally Magpie and CPA must share a network namespace and use loopback. Otherwise, enable CPA `allow-remote` yourself. We recommend restricting sources with a firewall, tunnel or private network. Different Docker containers on one host, private addresses and Tailscale addresses normally count as remote. The plugin does not change these settings. **Exposing management to the public internet is discouraged.**
 
-Quota belongs to the selected upstream **credential account**, rather than a model or the entire CPA credential pool. Adapters are selected by the credential's `provider` field. Currently only `claude` is implemented: it reports `5 hours` and `7 days` percentages, spans and reset times, without monetary values or account details. Discovering non-Claude models does not imply quota support for them.
+Quota belongs to the selected upstream **credential account**, rather than a model or the entire CPA credential pool. Adapters are selected by the credential's `provider` field. Currently only `claude` is implemented: it reports `5 hours` and `7 days` percentages, spans and reset times, without monetary values or account details. The management API also supplies model reasoning levels for the Claude channel; models with non-empty definitions are marked as reasoning and expose those levels. If the management API is unreachable, returns an error or no management key is configured, model discovery still succeeds without levels. Discovering non-Claude models does not imply quota or reasoning-level support.
 
 | Credential selection | Behavior |
 | --- | --- |

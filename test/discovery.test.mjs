@@ -3,12 +3,13 @@ import test from "node:test";
 import plugin from "../index.mjs";
 
 const auth = { type: "api", key: "test-biz-key-discovery", metadata: {
-  baseURL: "https://cpa.example.invalid", managementKey: "test-mgmt-key-LEAKCHECK",
+  baseURL: "https://cpa.example.invalid",
 } };
+const managementAuth = { ...auth, metadata: { ...auth.metadata, managementKey: "test-mgmt-key-LEAKCHECK" } };
 const id = "claude-sonnet-4-5-20250929";
 const row = { id, type: "model", display_name: "Claude Sonnet", max_input_tokens: 200000, max_tokens: 32000 };
 const catalog = rows => ({ data: rows, has_more: false, first_id: rows[0]?.id ?? "", last_id: rows.at(-1)?.id ?? "" });
-const discover = async (provider = {}) => (await plugin()).provider.models(provider, { auth });
+const discover = async (provider = {}, currentAuth = auth) => (await plugin()).provider.models(provider, { auth: currentAuth });
 
 test("discovery requests Anthropic format and keeps original IDs and known capabilities", async t => {
   const calls = [];
@@ -137,4 +138,66 @@ test("arbitrary model IDs remain own data properties without changing the model 
   assert.deepEqual(Object.keys(models), ids);
   for (const id of ids) assert.deepEqual(models[id], { id, name: id });
   assert.deepEqual(Object.keys(JSON.parse(JSON.stringify(models))), ids);
+});
+
+test("management definitions expose deduplicated levels and match dated or [1m] IDs", async t => {
+  const dated = "claude-opus-5-5-20261001[1m]";
+  const legacy = "claude-sonnet-4-5";
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    calls.push([String(input), init]);
+    if (String(input).endsWith("/v0/management/model-definitions/claude")) {
+      return Response.json({ channel: "claude", models: [
+        { id: "claude-opus-5-5", thinking: { levels: [" low ", "medium", "low", " ", "high"] } },
+        { id: legacy, thinking: { min: 1024, max: 32000 } },
+      ] });
+    }
+    return Response.json(catalog([{ id: dated }, { id: legacy }]));
+  });
+  const result = await discover({}, managementAuth);
+  assert.deepEqual(result[dated].variants, { low: {}, medium: {}, high: {} });
+  assert.equal(result[dated].capabilities.reasoning, true);
+  assert.deepEqual(result[legacy], { id: legacy, name: legacy });
+  assert.equal(calls.length, 2);
+  const modelHeaders = new Headers(calls[0][1].headers);
+  const definitionHeaders = new Headers(calls[1][1].headers);
+  assert.equal(modelHeaders.get("x-api-key"), auth.key);
+  assert.equal(modelHeaders.get("authorization"), null);
+  assert.equal(definitionHeaders.get("authorization"), "Bearer " + managementAuth.metadata.managementKey);
+  assert.equal(calls[1][1].redirect, "error");
+});
+
+test("user variants and reasoning capability override generated values", async t => {
+  t.mock.method(globalThis, "fetch", async input => String(input).endsWith("/v0/management/model-definitions/claude")
+    ? Response.json({ models: [{ id, thinking: { levels: ["low", "high"] } }] })
+    : Response.json(catalog([{ id }])));
+  const configured = { variants: { custom: { reasoningEffort: "custom" } },
+    capabilities: { reasoning: false, toolcall: true } };
+  const result = await discover({ models: { [id]: configured } }, managementAuth);
+  assert.deepEqual(result[id].variants, configured.variants);
+  assert.deepEqual(result[id].capabilities, configured.capabilities);
+});
+
+test("management definition failures downgrade without breaking discovery", async t => {
+  for (const failure of [
+    () => new Response("denied", { status: 401 }),
+    () => new Response("failed", { status: 500 }),
+    () => new Response("not JSON"),
+    () => { throw new Error("timeout"); },
+  ]) {
+    const mocked = t.mock.method(globalThis, "fetch", async input => {
+      if (String(input).endsWith("/v0/management/model-definitions/claude")) return failure();
+      return Response.json(catalog([{ id }]));
+    });
+    const result = await discover({}, managementAuth);
+    assert.deepEqual(result, { [id]: { id, name: id } });
+    assert.equal(mocked.mock.callCount(), 2);
+    mocked.mock.restore();
+  }
+});
+
+test("no management key skips model definitions", async t => {
+  const mocked = t.mock.method(globalThis, "fetch", async () => Response.json(catalog([{ id }])));
+  assert.deepEqual(await discover(), { [id]: { id, name: id } });
+  assert.equal(mocked.mock.callCount(), 1);
 });
