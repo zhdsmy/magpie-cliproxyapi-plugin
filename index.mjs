@@ -30,11 +30,6 @@ function managementHeaders(metadata) {
   return { Authorization: "Bearer " + metadata.managementKey, "Content-Type": "application/json" };
 }
 
-function modelDefinitionsBase(metadata) {
-  return metadata.managementURL ? normalizeURL(metadata.managementURL)
-    : normalizeURL(metadata.baseURL) + "/v0/management";
-}
-
 async function readJSON(response, maxBytes) {
   const decoder = new TextDecoder();
   let bytes = 0;
@@ -204,7 +199,7 @@ async function modelDefinitions(auth) {
   if (typeof metadata?.managementKey !== "string" || !metadata.managementKey) return new Map();
   try {
     const signal = AbortSignal.timeout(10_000);
-    const response = await fetch(modelDefinitionsBase(metadata) + "/model-definitions/claude", {
+    const response = await fetch(managementBase(metadata) + "/routing/model-definitions/claude", {
       headers: managementHeaders(metadata), signal, redirect: "error",
     });
     if (!response.ok) {
@@ -288,6 +283,7 @@ export default async function CLIProxyAPIPlugin() {
       async models(provider, { auth } = {}) {
         if (auth?.type !== "api" || !auth.key) return {};
         const baseURL = normalizeURL(auth.metadata?.baseURL);
+        const definitionsPromise = modelDefinitions(auth);
         const response = await fetch(baseURL + "/v1/models", {
           headers: { "x-api-key": auth.key, "anthropic-version": "2023-06-01" },
           signal: AbortSignal.timeout(10_000),
@@ -299,11 +295,12 @@ export default async function CLIProxyAPIPlugin() {
           if ([401, 403].includes(response.status)) error.signIn = "expired";
           throw error;
         }
-        const payload = await readJSON(response, 1 << 20);
+        const [payload, definitions] = await Promise.all([
+          readJSON(response, 1 << 20), definitionsPromise,
+        ]);
         if (!Array.isArray(payload?.data)) {
           throw new Error("Invalid CPA model list");
         }
-        const definitions = await modelDefinitions(auth);
         const models = {};
         for (const row of payload.data) {
           if (typeof row?.id !== "string" || !row.id.trim()) continue;

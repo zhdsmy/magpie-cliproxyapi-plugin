@@ -146,7 +146,7 @@ test("management definitions expose deduplicated levels and match dated or [1m] 
   const calls = [];
   t.mock.method(globalThis, "fetch", async (input, init) => {
     calls.push([String(input), init]);
-    if (String(input).endsWith("/v0/management/model-definitions/claude")) {
+    if (String(input).endsWith("/routing/model-definitions/claude")) {
       return Response.json({ channel: "claude", models: [
         { id: "claude-opus-5-5", thinking: { levels: [" low ", "medium", "low", " ", "high"] } },
         { id: legacy, thinking: { min: 1024, max: 32000 } },
@@ -159,16 +159,18 @@ test("management definitions expose deduplicated levels and match dated or [1m] 
   assert.equal(result[dated].capabilities.reasoning, true);
   assert.deepEqual(result[legacy], { id: legacy, name: legacy });
   assert.equal(calls.length, 2);
-  const modelHeaders = new Headers(calls[0][1].headers);
-  const definitionHeaders = new Headers(calls[1][1].headers);
+  const modelCall = calls.find(([input]) => input.endsWith("/v1/models"));
+  const definitionCall = calls.find(([input]) => input.endsWith("/routing/model-definitions/claude"));
+  const modelHeaders = new Headers(modelCall[1].headers);
+  const definitionHeaders = new Headers(definitionCall[1].headers);
   assert.equal(modelHeaders.get("x-api-key"), auth.key);
   assert.equal(modelHeaders.get("authorization"), null);
   assert.equal(definitionHeaders.get("authorization"), "Bearer " + managementAuth.metadata.managementKey);
-  assert.equal(calls[1][1].redirect, "error");
+  assert.equal(definitionCall[1].redirect, "error");
 });
 
 test("user variants and reasoning capability override generated values", async t => {
-  t.mock.method(globalThis, "fetch", async input => String(input).endsWith("/v0/management/model-definitions/claude")
+  t.mock.method(globalThis, "fetch", async input => String(input).endsWith("/routing/model-definitions/claude")
     ? Response.json({ models: [{ id, thinking: { levels: ["low", "high"] } }] })
     : Response.json(catalog([{ id }])));
   const configured = { variants: { custom: { reasoningEffort: "custom" } },
@@ -186,7 +188,7 @@ test("management definition failures downgrade without breaking discovery", asyn
     () => { throw new Error("timeout"); },
   ]) {
     const mocked = t.mock.method(globalThis, "fetch", async input => {
-      if (String(input).endsWith("/v0/management/model-definitions/claude")) return failure();
+      if (String(input).endsWith("/routing/model-definitions/claude")) return failure();
       return Response.json(catalog([{ id }]));
     });
     const result = await discover({}, managementAuth);
@@ -194,6 +196,23 @@ test("management definition failures downgrade without breaking discovery", asyn
     assert.equal(mocked.mock.callCount(), 2);
     mocked.mock.restore();
   }
+});
+
+test("explicit management URL uses the shared v8 routing base", async t => {
+  const explicitAuth = { ...managementAuth, metadata: {
+    ...managementAuth.metadata, managementURL: "https://cpa.example.invalid/v8/management",
+  } };
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    calls.push([String(input), init]);
+    return String(input).endsWith("/routing/model-definitions/claude")
+      ? Response.json({ models: [{ id, thinking: { levels: ["low"] } }] })
+      : Response.json(catalog([{ id }]));
+  });
+  const result = await discover({}, explicitAuth);
+  assert.deepEqual(result[id].variants, { low: {} });
+  assert.equal(calls.length, 2);
+  assert.ok(calls.some(([input]) => input === "https://cpa.example.invalid/v8/management/routing/model-definitions/claude"));
 });
 
 test("no management key skips model definitions", async t => {
