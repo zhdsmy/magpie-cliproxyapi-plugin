@@ -47,33 +47,33 @@ test("config registers only cpa and preserves existing configuration", async () 
   assert.deepEqual(custom.provider.other, {});
 });
 
-test("authorize is local, normalizes metadata and leaves the business key to Magpie", async t => {
+test("authorize is local and returns the business key separately from metadata", async t => {
   const hooks = await plugin();
   assert.equal(hooks.auth.provider, "cpa");
   const method = hooks.auth.methods[0];
   assert.equal(method.type, "api");
   assert.deepEqual(method.prompts.map(({ key, type }) => [key, type]), [
-    ["baseURL", "text"], ["managementKey", "password"], ["managementURL", "text"], ["credential", "text"],
+    ["baseURL", "text"], ["businessKey", "password"], ["managementKey", "password"], ["managementURL", "text"], ["credential", "text"],
   ]);
   const unexpected = t.mock.method(globalThis, "fetch", () => { throw new Error("Unexpected network request"); });
   const result = await method.authorize({
-    baseURL: "https://cpa.example.invalid:8317/v1/", key: bizKey,
+    baseURL: "https://cpa.example.invalid:8317/v1/", businessKey: bizKey,
     managementURL: "https://management.example.invalid/v8/management/",
     managementKey: " " + managementKey + " ", credential: " credential-one ",
   });
-  assert.deepEqual(result, { type: "success", metadata: {
+  assert.deepEqual(result, { type: "success", key: bizKey, metadata: {
     baseURL: "https://cpa.example.invalid:8317", email: "cpa@cpa.example.invalid:8317",
     managementURL: "https://management.example.invalid/v8/management", managementKey, credential: "credential-one",
   } });
-  assert.ok(!("key" in result));
   assert.ok(!JSON.stringify(result.metadata).includes(bizKey));
-  assert.deepEqual(await method.authorize({ baseURL }), { type: "success", metadata: {
+  assert.deepEqual(await method.authorize({ baseURL, businessKey: bizKey }), { type: "success", key: bizKey, metadata: {
     baseURL, email: "cpa@cpa.example.invalid",
   } });
-  assert.deepEqual(await method.authorize({ baseURL, managementKey: " ", managementURL: " ", credential: " " }),
-    await method.authorize({ baseURL }));
-  assert.equal((await method.authorize({ baseURL, managementURL: "https://user:secret@example.invalid" })).type, "failed");
-  assert.equal((await method.authorize({ baseURL: "not-a-url" })).type, "failed");
+  assert.deepEqual(await method.authorize({ baseURL, businessKey: bizKey, managementKey: " ", managementURL: " ", credential: " " }),
+    await method.authorize({ baseURL, businessKey: bizKey }));
+  assert.equal((await method.authorize({ baseURL })).type, "failed");
+  assert.equal((await method.authorize({ baseURL, businessKey: bizKey, managementURL: "https://user:secret@example.invalid" })).type, "failed");
+  assert.equal((await method.authorize({ baseURL: "not-a-url", businessKey: bizKey })).type, "failed");
   assert.equal(unexpected.mock.callCount(), 0);
 });
 

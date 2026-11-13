@@ -80,6 +80,28 @@ function usageWindows(data) {
 }
 
 const usageAdapters = {
+  codex: {
+    request: {
+      method: "GET", url: "https://chatgpt.com/backend-api/wham/usage",
+      header: { Authorization: "Bearer $TOKEN$", Accept: "application/json" },
+    },
+    parse(data) {
+      const plan = typeof data?.plan_type === "string" && /^[a-z0-9_-]{1,30}$/i.test(data.plan_type) ? data.plan_type : "unknown";
+      const windows = [];
+      for (const row of [data?.rate_limit?.primary_window, data?.rate_limit?.secondary_window]) {
+        if (!row || typeof row.used_percent !== "number" || !Number.isFinite(row.used_percent) || row.used_percent < 0 ||
+            !Number.isSafeInteger(row.limit_window_seconds) || row.limit_window_seconds <= 0) continue;
+        const days = row.limit_window_seconds / 86400;
+        const hours = row.limit_window_seconds / 3600;
+        const duration = Number.isInteger(days) ? days + "d" : Number.isInteger(hours) ? hours + "h" : row.limit_window_seconds + "s";
+        const window = { name: plan[0].toUpperCase() + plan.slice(1) + "/" + duration, used: row.used_percent, span: row.limit_window_seconds };
+        if (Number.isFinite(row.reset_at) && row.reset_at > 0 && row.reset_at < 8640000000000) window.resetsAt = new Date(row.reset_at * 1000).toISOString();
+        windows.push(window);
+      }
+      if (!windows.length) throw new UsageError("CPA returned no valid Codex quota windows");
+      return windows;
+    },
+  },
   claude: {
     request: {
       method: "GET", url: "https://api.anthropic.com/api/oauth/usage",
@@ -141,29 +163,47 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
             : rows.filter(supported);
           if (!matches.length) throw new UsageError(selection ? "Selected CPA credential is missing or disabled"
             : rows.length ? "Quota is not supported for this provider yet" : "No enabled CPA credential found", { stale: false });
-          if (matches.length !== 1) throw new UsageError("Multiple CPA credentials; choose a unique name or auth_index", { stale: false });
-          const credential = matches[0];
-          if (!supported(credential)) throw new UsageError("Quota is not supported for this provider yet", { stale: false });
-          const adapter = adapters[credential.provider];
-          if (typeof credential.auth_index !== "string" || !credential.auth_index.trim() || credential.auth_index.length > 128) {
-            throw new UsageError("Invalid CPA auth_index; check the selected credential", { stale: false });
-          }
-          const payload = await call("/requests/api-call", 256 << 10, {
-            ...adapter.request, auth_index: credential.auth_index,
-          });
-          if (payload?.status_code !== 200) {
-            throw new UsageError(payload?.status_code === 401 ? "CPA upstream credential rejected; refresh it in CPA"
-              : "CPA upstream usage request failed; retry later");
-          }
-          if (typeof payload.body !== "string") throw new UsageError("Invalid CPA usage response");
-          const windows = adapter.parse(JSON.parse(payload.body));
-          if (rows.length > 1) {
-            const label = [credential.label, credential.name].find(value => typeof value === "string" && value.trim());
-            for (const window of windows) {
-              window.name += " (credential " + (label || "selected") + ")";
-              window.aside = true;
+          const codexPool = !selection && matches.some(row => row.provider === "codex") &&
+            matches.every(row => row.provider === "codex" || row.provider === "claude");
+          if (matches.length !== 1 && !codexPool) throw new UsageError("Multiple CPA credentials; choose a unique name or auth_index", { stale: false });
+          if (codexPool) matches.sort((a, b) => String(a.auth_index).localeCompare(String(b.auth_index)));
+          for (const credential of matches) {
+            if (!supported(credential)) throw new UsageError("Quota is not supported for this provider yet", { stale: false });
+            if (typeof credential.auth_index !== "string" || !credential.auth_index.trim() || credential.auth_index.length > 128) {
+              throw new UsageError("Invalid CPA auth_index; check the selected credential", { stale: false });
             }
           }
+          const windows = [];
+          for (const [index, credential] of matches.entries()) {
+            const adapter = adapters[credential.provider];
+            const payload = await call("/requests/api-call", 256 << 10, {
+              ...adapter.request, auth_index: credential.auth_index,
+            });
+            if (payload?.status_code !== 200) {
+              throw new UsageError(payload?.status_code === 401 ? "CPA upstream credential rejected; refresh it in CPA"
+                : "CPA upstream usage request failed; retry later");
+            }
+            if (typeof payload.body !== "string") throw new UsageError("Invalid CPA usage response");
+            const credentialWindows = adapter.parse(JSON.parse(payload.body));
+            if (credential.provider === "codex" || credential.provider === "claude") {
+              for (const window of credentialWindows) {
+                if (credential.provider === "claude") window.name = window.name.replace("5 hours", "5h").replace("7 days", "7d");
+                window.name = (credential.provider === "codex" ? "Codex" : "Claude") + "/" + window.name;
+              }
+            }
+            if (rows.length > 1) {
+              const label = [credential.label, credential.name].find(value => typeof value === "string" && value.trim());
+              for (const window of credentialWindows) {
+                if (codexPool) window.name += "/#" + (index + 1);
+                else if (credential.provider === "claude" || credential.provider === "codex") window.name += "/" + (label || "selected");
+                else window.name += " (credential " + (label || "selected") + ")";
+                window.aside = true;
+              }
+            }
+            windows.push(...credentialWindows);
+          }
+          const planOrder = window => /^Codex\/plus\//i.test(window.name) ? 0 : /^Codex\/free\//i.test(window.name) ? 2 : 1;
+          windows.sort((a, b) => planOrder(a) - planOrder(b));
           entry.value = { windows, signIn: "kept" };
           entry.updatedAt = now();
           entry.error = undefined;
@@ -245,6 +285,7 @@ export default async function CLIProxyAPIPlugin() {
         label: "CLIProxyAPI business API key",
         prompts: [
           { type: "text", key: "baseURL", message: "CPA Base URL", validate: validateURL },
+          { type: "password", key: "businessKey", message: "Business API key", validate: value => typeof value === "string" && value.trim() ? undefined : "Business API key is required" },
           { type: "password", key: "managementKey", message: "Management key (optional, for usage)" },
           { type: "text", key: "managementURL", message: "Management URL (optional)",
             validate: value => validateURL(value, true) },
@@ -253,6 +294,8 @@ export default async function CLIProxyAPIPlugin() {
         async authorize(inputs) {
           try {
             const baseURL = normalizeURL(inputs?.baseURL);
+            const key = inputs?.businessKey?.trim();
+            if (!key) return { type: "failed", error: "Business API key is required" };
             const metadata = { baseURL, email: "cpa@" + new URL(baseURL).host };
             const managementURL = inputs?.managementURL?.trim();
             if (managementURL) metadata.managementURL = normalizeURL(managementURL);
@@ -260,8 +303,7 @@ export default async function CLIProxyAPIPlugin() {
               const value = inputs?.[field]?.trim();
               if (value) metadata[field] = value;
             }
-            // Magpie supplies the business key after authorize; API account labels use metadata.email.
-            return { type: "success", metadata };
+            return { type: "success", key, metadata };
           } catch {
             return { type: "failed", error: "Invalid CPA or management URL" };
           }
@@ -284,22 +326,32 @@ export default async function CLIProxyAPIPlugin() {
         if (auth?.type !== "api" || !auth.key) return {};
         const baseURL = normalizeURL(auth.metadata?.baseURL);
         const definitionsPromise = modelDefinitions(auth);
-        const response = await fetch(baseURL + "/v1/models", {
-          headers: { "x-api-key": auth.key, "anthropic-version": "2023-06-01" },
-          signal: AbortSignal.timeout(10_000),
-          redirect: "error",
+        const fetchModels = headers => fetch(baseURL + "/v1/models", {
+          headers, signal: AbortSignal.timeout(10_000), redirect: "error",
         });
+        const response = await fetchModels({ "x-api-key": auth.key, "anthropic-version": "2023-06-01" });
         if (!response.ok) {
           await response.body?.cancel();
           const error = new Error("CPA model discovery failed (HTTP " + response.status + ")");
           if ([401, 403].includes(response.status)) error.signIn = "expired";
           throw error;
         }
-        const [payload, definitions] = await Promise.all([
+        let [payload, definitions] = await Promise.all([
           readJSON(response, 1 << 20), definitionsPromise,
         ]);
         if (!Array.isArray(payload?.data)) {
           throw new Error("Invalid CPA model list");
+        }
+        if (payload.data.length && payload.data.every(row => typeof row?.id === "string" && row.id.startsWith("claude-fable-5-dd-"))) {
+          const fallback = await fetchModels({ Authorization: "Bearer " + auth.key });
+          if (!fallback.ok) {
+            await fallback.body?.cancel();
+            const error = new Error("CPA model discovery failed (HTTP " + fallback.status + ")");
+            if ([401, 403].includes(fallback.status)) error.signIn = "expired";
+            throw error;
+          }
+          payload = await readJSON(fallback, 1 << 20);
+          if (!Array.isArray(payload?.data)) throw new Error("Invalid CPA model list");
         }
         const models = {};
         for (const row of payload.data) {
