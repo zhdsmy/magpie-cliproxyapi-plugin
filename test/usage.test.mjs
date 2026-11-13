@@ -53,8 +53,8 @@ test("single enabled credential uses the exact api-call template and percentage 
   const h = harness({ files: [null, { ...row, provider: "other", disabled: true }, { ...row, disabled: true }, row] });
   const result = await h.get();
   assert.deepEqual(result, { signIn: "kept", windows: [
-    { name: "5 hours", used: 25, span: 18000, resetsAt: "2026-11-04T00:00:00.000Z" },
-    { name: "7 days", used: 50, span: 604800, resetsAt: "2026-11-04T00:00:00.000Z" },
+    { name: "Claude/5h", used: 25, span: 18000, resetsAt: "2026-11-04T00:00:00.000Z" },
+    { name: "Claude/7d", used: 50, span: 604800, resetsAt: "2026-11-04T00:00:00.000Z" },
   ] });
   assert.equal(h.calls.length, 2);
   const [credentials, api] = h.calls;
@@ -91,11 +91,11 @@ test("selected multi-credential windows are display-only and use label/name, nev
     const h = harness({ files: [row, { ...second, email: "private-response-marker" }] });
     const result = await h.get({ credential });
     assert.equal(JSON.parse(h.calls[1].init.body).auth_index, "index-two");
-    assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("(credential Second)")));
+    assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("/Second")));
     assert.ok(!JSON.stringify(result).includes("private-response-marker"));
   }
   const h = harness({ files: [row, { ...second, label: undefined }] });
-  assert.match((await h.get({ credential: "two" })).windows[0].name, /credential two/);
+  assert.ok((await h.get({ credential: "two" })).windows[0].name.endsWith("/two"));
   const single = harness();
   assert.equal((await single.get({ credential: "one" })).windows[0].aside, undefined);
 });
@@ -191,14 +191,14 @@ test("only valid known percentage windows survive; values over 100 are preserved
   const h = harness({ usage: envelope({ five_hour: window(125), seven_day: window(0, null),
     seven_day_sonnet: window(99), new_future_window: { anything: true }, limits: [{ unknown: true }] }) });
   assert.deepEqual((await h.get()).windows, [
-    { name: "5 hours", used: 125, span: 18000, resetsAt: "2026-11-04T00:00:00.000Z" },
-    { name: "7 days", used: 0, span: 604800 },
+    { name: "Claude/5h", used: 125, span: 18000, resetsAt: "2026-11-04T00:00:00.000Z" },
+    { name: "Claude/7d", used: 0, span: 604800 },
   ]);
   for (const invalid of [null, {}, window(-1), window("0"), window(true), window(null),
     window(1, null), window(0, "not-a-date"), { utilization: 0 }]) {
     const one = await harness({ usage: envelope({ five_hour: invalid, seven_day: window(10) }) }).get();
     assert.equal(one.windows.length, 1);
-    assert.equal(one.windows[0].name, "7 days");
+    assert.equal(one.windows[0].name, "Claude/7d");
     assertError(await harness({ usage: envelope({ five_hour: invalid }) }).get());
   }
   const body = '{"five_hour":{"utilization":1e999,"resets_at":"' + reset + '"}}';
@@ -400,7 +400,7 @@ test("automatic selection uses the sole enabled supported credential; a mixed po
     { ...second, auth_index: "disabled", disabled: true }] });
   const result = await h.get();
   assert.equal(JSON.parse(h.calls[1].init.body).auth_index, row.auth_index);
-  assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("(credential First)")));
+  assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("/First")));
 });
 
 test("several supported providers require an explicit unique selection and share the aside rule", async () => {

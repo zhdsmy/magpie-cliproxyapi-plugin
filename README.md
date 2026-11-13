@@ -2,7 +2,7 @@
 
 [English](README.en.md)
 
-将 CLIProxyAPI（CPA）提供的模型接入 Magpie，并可选通过 CPA 管理接口查询凭据额度和 Claude 思考等级。目前额度适配器仅支持 Claude 的五小时、总周限已用百分比。无需额外 shim；OAuth 登录、Token 刷新和上游凭据选择均由 CPA 负责。
+将 CLIProxyAPI（CPA）提供的模型接入 Magpie，并可选通过 CPA 管理接口查询凭据额度和 Claude 思考等级。额度适配器支持 Claude 与 Codex（ChatGPT）凭据。无需额外 shim；OAuth 登录、Token 刷新和上游凭据选择均由 CPA 负责。
 
 已验证 Magpie 0.1.2790 / 0.1.2826 与 CPA 8.0.51 的 Claude 链路。多供应商扩展仅经 mock 测试，非 Claude 后端的实际能力仍需自行验证。
 
@@ -29,7 +29,7 @@ Magpie 服务运行中执行登录后，请运行 `magpie plugin on <安装时�
 | Management key | 可选，密码输入；用于额度和 Claude 思考等级。不填仍可推理，但不查询管理接口，也不显示思考等级。 |
 | Management URL | 可选，**完整管理入口**，例如 `http://127.0.0.1:8317/v8/management`；默认 `<CPA Base URL>/v8/management`。 |
 | CPA credential | 可选，按 CPA 凭据的 `name` 或 `auth_index` 精确选择。 |
-| Business API key | Magpie 随后要求输入的 CPA 业务 key，用于模型发现与推理。 |
+| Business API key | 插件登录表单必填、由 authorize 返回宿主的 CPA 业务 key，用于模型发现与推理。 |
 
 业务 key 与管理 key 分开使用，同存于 Magpie 的 `plugin-auth.json`，由宿主以 0600 权限保存。插件不读取 CPA 的 OAuth 文件。
 
@@ -43,13 +43,13 @@ Magpie 服务运行中执行登录后，请运行 `magpie plugin on <安装时�
 
 CPA 只把其看到的 `127.0.0.1` / `::1` 视为本机。通常需要 Magpie 与 CPA 处于同一网络命名空间并使用回环地址；否则需由你开启 CPA `allow-remote`；建议配合来源防火墙、隧道或私网限制访问。同机不同 Docker 容器、私网或 Tailscale 地址通常仍算远程。插件不修改这些设置，**不建议公开管理接口到公网**。
 
-额度按所选上游**凭据账号**计算，不是按模型计算，也不代表整个 CPA 凭据池。适配器按管理接口返回的凭据 `provider` 分派；目前只有 `claude`，仅输出 `5 hours` / `7 days` 百分比、跨度和重置时间，不显示金额或账户资料。管理接口还提供 Claude 频道的模型思考等级；插件把有等级定义的模型标为 reasoning 并显示等级。等级请求路径为 `GET <管理基址>/routing/model-definitions/claude`。如果管理接口前有反向代理白名单，必须放行此路径，否则不会显示等级。管理接口不可达、返回错误或没有管理 key 时，模型仍正常发现但不带等级。发现非 Claude 模型不代表支持其额度或思考等级。
+额度按所选上游**凭据账号**计算，不是按模型计算，也不代表整个 CPA 凭据池。适配器按管理接口返回的凭据 `provider` 分派；支持 `claude` 与 `codex`，输出已用百分比、跨度和重置时间，不显示金额或账户资料。管理接口还提供 Claude 频道的模型思考等级；插件把有等级定义的模型标为 reasoning 并显示等级。等级请求路径为 `GET <管理基址>/routing/model-definitions/claude`。如果管理接口前有反向代理白名单，必须放行此路径，否则不会显示等级。管理接口不可达、返回错误或没有管理 key 时，模型仍正常发现但不带等级。发现非 Claude 模型不代表支持其额度或思考等级。
 
 | 凭据选择 | 行为 |
 | --- | --- |
 | 未指定，没有启用且受支持的凭据 | 显示“暂不支持额度”或没有启用凭据的错误，不输出窗口。 |
 | 未指定，唯一启用且受支持的凭据 | 自动选择；总共只有一个启用凭据时参与额度路由，否则仅展示。 |
-| 未指定，多个启用且受支持的凭据 | 显示要求指定凭据的错误。 |
+| 未指定，多个启用且受支持的凭据 | 若包含 Codex 且全部为 Claude / Codex，逐个查询并统一展示，全部为 aside；其他情况仍要求指定凭据。 |
 | 指定并唯一匹配受支持凭据 | 查询该账号；多个启用凭据时带标签，全部为 `aside`，**只展示、不参与路由**。 |
 | 指定凭据的 provider 尚无适配器 | 只报“该供应商暂不支持额度”，不调用上游额度接口，不改查 Claude。 |
 | 选择不存在、已禁用或不唯一 | 显示错误，不回退到其他凭据。 |
@@ -57,6 +57,12 @@ CPA 只把其看到的 `127.0.0.1` / `::1` 视为本机。通常需要 Magpie �
 启用凭据总数包括尚不支持额度的供应商。多凭据时，即使只有一个可查询，也不能保证 CPA 的业务请求使用它，因此仍只展示其窗口。
 
 可用 `magpie quota --json` 查看读数。宿主报告 JSON 不输出 `aside` 字段，这不表示多凭据窗口参与路由。
+
+
+
+Codex 通过管理 api-call 查询 `https://chatgpt.com/backend-api/wham/usage` 的 primary / secondary 窗口。名称如 `Codex/Plus/5h/#2`、`Codex/Free/30d/#1`，Plus 排在 Free 前；编号按 auth_index 排序，凭据集合变化后可能改变。Claude 名称缩短为 `Claude/5h`、`Claude/7d`，原有请求与百分比解析不变。不同账号和周期不求和、不平均，不展示模型权限或邮箱。多凭据共用 15 秒预算，任一读取失败会按原有缓存及退避规则处理整组读数。
+
+若非空 Anthropic 格式模型列表全部是 cloaking 编码 ID，额外请求一次 OpenAI 格式列表，保留返回的原始 ID；普通列表和有效空列表不触发回退。
 
 ## 鉴权失败与恢复
 
@@ -73,7 +79,7 @@ CPA 对同一来源 IP 的管理鉴权失败累计 5 次会封禁 30 分钟，�
 - 管理 api-call 内的 OAuth usage 请求使用固定 UA `claude-cli/2.1.280 (external, cli)` 及 beta 头；Anthropic 调整要求时可能需要更新插件。
 - Magpie 额度卡片有约一分钟缓存；即时重复读取可能不调用插件，GUI 卡片的刷新按钮可强制重新读取。
 - Magpie 会把良好额度落盘，在某些临时错误时继续回显并标记 `asOf`，重启后也可能保留。**插件的 900 秒上限不约束宿主这层旧值保留**，请留意读数时间。
-- 目前额度适配器只有 Claude；不输出 Opus/Sonnet 等模型专属窗口，也不把单凭据额度当作整个池的额度。
+- Claude 额度不输出 Opus/Sonnet 等模型专属窗口，也不把单凭据额度当作整个池的额度。
 - 非 Claude 模型的工具、思考、prompt 缓存和计数等能力取决于 CPA 转换与实际后端，需自行验证；模型发现成功不等于这些能力已验收。
 - 不提供 OAuth 登录、Token 刷新、模型改写或自定义故障切换。count_tokens 的同模型故障切换与恢复仍取决于宿主，尚未验收。
 
