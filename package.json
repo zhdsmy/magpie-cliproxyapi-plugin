@@ -1,6 +1,6 @@
 {
   "name": "magpie-cliproxyapi-plugin",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Magpie provider for Claude via CLIProxyAPI, with optional quota, reset-card and reasoning-level readings",
   "type": "module",
   "main": "./index.mjs",
