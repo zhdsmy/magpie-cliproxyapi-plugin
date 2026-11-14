@@ -184,26 +184,32 @@ function codexPlan(value) {
   return ["free", "go", "plus", "pro", "team", "business", "enterprise", "edu"].includes(value) ? value : undefined;
 }
 
-function codexWindows(data) {
+function codexWindows(data, now) {
   const windows = [];
   for (const row of [data?.rate_limit?.primary_window, data?.rate_limit?.secondary_window]) {
     if (typeof row?.used_percent !== "number" || !Number.isFinite(row.used_percent) ||
         row.used_percent < 0 || row.used_percent > 100 ||
-        !Number.isSafeInteger(row.limit_window_seconds) || row.limit_window_seconds <= 0 ||
-        typeof row.reset_at !== "number" || !Number.isFinite(row.reset_at) ||
-        row.reset_at <= 0 || row.reset_at > 8.64e12) continue;
+        !Number.isSafeInteger(row.limit_window_seconds) || row.limit_window_seconds <= 0) continue;
+    let reset = row.reset_at;
+    if (reset == null && row.reset_after_seconds != null) {
+      const after = row.reset_after_seconds;
+      if (typeof after !== "number" || !Number.isFinite(after) || after < 0) continue;
+      reset = now / 1000 + after;
+    }
+    if (reset != null && (typeof reset !== "number" || !Number.isFinite(reset) || reset <= 0 || reset > 8.64e12)) continue;
     const span = row.limit_window_seconds;
     const [unit, seconds] = [["day", 86400], ["hour", 3600], ["minute", 60], ["second", 1]]
       .find(([, seconds]) => span % seconds === 0);
     const count = span / seconds;
-    windows.push({ name: count + " " + unit + (count === 1 ? "" : "s"), used: row.used_percent,
-      span, resetsAt: new Date(row.reset_at * 1000).toISOString() });
+    const window = { name: count + " " + unit + (count === 1 ? "" : "s"), used: row.used_percent, span };
+    if (reset != null) window.resetsAt = new Date(reset * 1000).toISOString();
+    windows.push(window);
   }
   if (!windows.length) throw new UsageError("CPA returned no valid Codex quota windows");
   return windows;
 }
 
-async function readCodexUsage(apiCall, credential) {
+async function readCodexUsage(apiCall, credential, { now }) {
   const header = { Authorization: "Bearer $TOKEN$", "Content-Type": "application/json",
     "User-Agent": "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)" };
   const accountId = credential.id_token?.chatgpt_account_id;
@@ -211,7 +217,7 @@ async function readCodexUsage(apiCall, credential) {
     header["Chatgpt-Account-Id"] = accountId.trim();
   }
   const data = await apiCall({ method: "GET", url: "https://chatgpt.com/backend-api/wham/usage", header });
-  return { windows: codexWindows(data), plan: codexPlan(data?.plan_type) };
+  return { windows: codexWindows(data, now), plan: codexPlan(data?.plan_type) };
 }
 
 function codexSignalWindows(credential, now) {
@@ -408,8 +414,6 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
           if (rows.length > 1 && entry.value?.windows.some(window => !window.aside)) entry.value = undefined;
           matches.sort((a, b) => a.provider.localeCompare(b.provider) || credentialLabel(a).localeCompare(credentialLabel(b)) ||
             String(a.auth_index).localeCompare(String(b.auth_index)));
-          const readings = new Array(matches.length);
-          let next = 0;
           const read = async credential => {
             if (!supported(credential)) throw new UsageError("Quota is not supported for this provider yet", { stale: false });
             const adapter = adapters[credential.provider];
@@ -434,19 +438,16 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
             };
             return credentialReading(credential, adapter, apiCall);
           };
-          const worker = async () => {
-            while (next < matches.length) {
+          const readings = await Promise.all(matches.map(async credential => {
+            try {
               if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
               signal.throwIfAborted();
-              const index = next++;
-              try { readings[index] = { reading: await read(matches[index]) }; }
-              catch (error) {
-                if (error?.permanent || blocked.has(scope)) throw new UsageError(blocked.get(scope) ?? error.message, { permanent: true });
-                readings[index] = { error };
-              }
+              return { reading: await read(credential) };
+            } catch (error) {
+              if (error?.permanent || blocked.has(scope)) throw new UsageError(blocked.get(scope) ?? error.message, { permanent: true });
+              return { error };
             }
-          };
-          await Promise.all(Array.from({ length: Math.min(2, matches.length) }, worker));
+          }));
           if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
           const successes = readings.filter(result => result.reading);
           if (!successes.length) throw readings[0].error;
@@ -458,7 +459,7 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
               ? { ...window, name: window.name + " (" + label + ")", aside: true } : { ...window });
           });
           entry.value = { windows, signIn: "kept" };
-          if (rows.length === 1) {
+          if (matches.length === 1) {
             const reading = successes[0].reading;
             if (reading.resets) entry.value.resets = reading.resets;
             if (reading.plan) entry.value.plan = reading.plan;
@@ -619,9 +620,10 @@ export default async function CLIProxyAPIPlugin() {
           definitionsPromise,
         ]);
         const failure = lists.find(result => result.status === "rejected" && result.reason?.signIn === "expired")
-          ?? lists.find(result => result.status === "rejected");
+          ?? (lists[0].status === "rejected" ? lists[0] : undefined);
         if (failure) throw failure.reason;
-        const [rows, namedRows] = lists.map(result => result.value);
+        const rows = lists[0].value;
+        const namedRows = lists[1].value ?? [];
         const names = new Map(namedRows.filter(row => typeof row?.id === "string")
           .map(row => [row.id, row.display_name]));
         const models = {};
@@ -630,7 +632,7 @@ export default async function CLIProxyAPIPlugin() {
           if (row.id.startsWith("claude-fable-5-dd-")) continue;
           const configured = provider?.models?.[row.id];
           const definition = definitions.get(row.id) ?? definitions.get(definitionBase(row.id));
-          const name = names.get(row.id) ?? row.display_name;
+          const name = names.get(row.id);
           const model = { ...configured, id: row.id,
             name: typeof name === "string" && name ? name : row.id };
           applyReasoning(model, definition, configured);

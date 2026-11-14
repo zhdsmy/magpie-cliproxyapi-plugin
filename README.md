@@ -39,7 +39,7 @@ Magpie 服务运行中执行登录后，请运行 `magpie plugin on <安装时�
 
 插件返回的 metadata 不含业务 key。旧版宿主会把登录回答额外复制到同一文件的 `metadata.businessKey`；新版宿主不复制 password 回答。
 
-模型名称为 `cpa/<CPA 模型 ID>`，例如 `cpa/claude-sonnet-4-6`。发给 CPA 的模型 ID 保持原样。插件通过 CPA 的 Anthropic 兼容接口转发 Messages、SSE、工具往返和 count_tokens。发现并行读取 OpenAI 格式列表的真实 ID 和 Anthropic 格式列表的名称，不随凭据组合切换策略。仅排除 `claude-fable-5-dd-` 开头的 cloaking 编码 ID；实际暴露范围由 Magpie 的模型选择与白名单控制。非 Claude 模型也经 Anthropic 接口推理，本项目未验证；不按模型切换 Responses 协议。
+模型名称为 `cpa/<CPA 模型 ID>`，例如 `cpa/claude-sonnet-4-6`。发给 CPA 的模型 ID 保持原样。插件通过 CPA 的 Anthropic 兼容接口转发 Messages、SSE、工具往返和 count_tokens。发现并行读取 OpenAI 格式列表的真实 ID 和 Anthropic 格式列表的名称，不随凭据组合切换策略。名称列表遇到非 401/403 错误时，使用 ID 作为名称；OpenAI 列表失败仍整体失败，任一列表 401/403 都标记登录过期。仅排除 `claude-fable-5-dd-` 开头的 cloaking 编码 ID；实际暴露范围由 Magpie 的模型选择与白名单控制。非 Claude 模型也经 Anthropic 接口推理，本项目未验证；不按模型切换 Responses 协议。
 
 已有名为 `cpa` 的自定义 provider 时，Magpie 会把插件的**生效 ID** 改为 `cpa-plugin`，模型变为 `cpa-plugin/<ID>`。用 `magpie providers`、`magpie models` 或网关模型目录确认；`magpie plugin --json` 仍可能只显示插件自报的 `cpa`。
 
@@ -64,7 +64,7 @@ CPA 只把其看到的 `127.0.0.1` / `::1` 视为本机。通常需要 Magpie �
 
 多凭据窗口名为 `<窗口名> (<Claude|Codex> <标签>)`，按 provider、标签排序。标签优先使用 `label`；为空、含 `@` 或控制字符时，使用不透明 `auth_index` 的前 8 位。不使用 `name`，因为它常含邮箱。显式选择也使用同一标签规则。
 
-同一管理入口与 key 的凭据读取并发最多 2，共用一次调用的 15 秒预算。单个凭据失败时显示带标签的纯文本 `aside` 行，其他凭据继续展示；全部失败才整体报错。管理 401/403 始终整体停止；已发出的并行请求可以完成，不启动排队请求。多凭据不显示或合并重置卡。
+同一管理入口与 key 的凭据读取并发最多 2，共用一次调用的 15 秒预算。单个凭据失败时显示带标签的纯文本 `aside` 行，其他凭据继续展示；全部失败才整体报错。管理 401/403 始终整体停止；已发出的并行请求可以完成，不启动排队请求。同时读取多个凭据时不显示或合并重置卡；只读取一个凭据时（含池内显式选择），照常返回 `resets` 和 `plan`，与 `aside` 无关。
 
 可用 `magpie quota --json` 查看读数。宿主报告 JSON 不输出 `aside` 字段，这不表示多凭据窗口参与路由。
 
@@ -72,7 +72,7 @@ CPA 只把其看到的 `127.0.0.1` / `::1` 视为本机。通常需要 Magpie �
 
 主动请求为 `GET https://chatgpt.com/backend-api/wham/usage`，经 CPA 管理 `api-call` 发送，凭据仍用 `$TOKEN$` 占位。若 `/credentials` 返回 `id_token.chatgpt_account_id`，请求带上 `Chatgpt-Account-Id`；缺失时省略，不猜工作区。
 
-只解析 `rate_limit.primary_window` / `secondary_window`，异常窗口跳过，无有效窗口时报错。单凭据时将白名单内的套餐类型放入 usage 的 `plan` 字段，不拼进窗口名。若 CPA 返回不超过 5 分钟、完整且未过期的 `x-codex-*` 主次窗口信号，直接展示，不主动请求 ChatGPT。相对重置时间以 CPA 的观察时间为起点。主动和被动路径均只经 mock 测试。
+只解析 `rate_limit.primary_window` / `secondary_window`，异常窗口跳过，无有效窗口时报错。只读取一个凭据时将白名单内的套餐类型放入 usage 的 `plan` 字段，不拼进窗口名。主动读取优先用 `reset_at`；缺失时按读取时刻加 `reset_after_seconds` 计算；两者都没有时保留窗口，省略 `resetsAt`。若 CPA 返回不超过 5 分钟、完整且未过期的 `x-codex-*` 主次窗口信号，直接展示，不主动请求 ChatGPT。被动信号的相对重置时间以 CPA 的观察时间为起点。主动和被动路径均只经 mock 测试。
 
 不读取 `additional_rate_limits`、Codex 重置卡、credits 或订阅到期时间。社区的实测结果不能代替本项目对真实 CPA / ChatGPT 的验收。
 

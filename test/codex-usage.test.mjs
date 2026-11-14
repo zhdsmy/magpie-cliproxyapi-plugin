@@ -74,7 +74,7 @@ test("Codex skips malformed windows and errors when none is valid", async () => 
     { ...window(), used_percent: 101 }, { ...window(), used_percent: Infinity },
     { ...window(), limit_window_seconds: 0 }, { ...window(), limit_window_seconds: 1.5 },
     { ...window(), limit_window_seconds: "18000" }, { ...window(), reset_at: "1794646800" },
-    { ...window(), reset_at: null }, { ...window(), reset_at: -1 }, { ...window(), reset_at: 8.64e12 + 1 }];
+    { ...window(), reset_at: -1 }, { ...window(), reset_at: 8.64e12 + 1 }];
   for (const row of malformed) {
     const result = await harness([codex], { rate_limit: { primary_window: row, secondary_window: window(50) } }).get();
     assert.equal(result.windows.length, 1);
@@ -133,7 +133,7 @@ test("pure Claude, pure Codex and mixed pools display all supported credentials 
   const selected = await harness([codex, claude]).get(claude.auth_index);
   assert.equal(selected.windows.length, 2);
   assert.ok(selected.windows.every(w => w.aside));
-  assert.equal(selected.resets, undefined);
+  assert.equal(selected.resets.count, 1);
   assert.equal((await harness([claude]).get()).resets.count, 1);
 });
 
@@ -159,7 +159,7 @@ test("a failed credential is a text aside row; all failed credentials return an 
   assert.equal(all.windows, undefined);
 });
 
-test("credential workers run at most two reads concurrently and share the 15-second signal", async () => {
+test("credential reads use the scope limit of two and share the 15-second signal", async () => {
   let running = 0, peak = 0;
   const pending = [];
   const files = Array.from({ length: 5 }, (_, i) => ({ ...codex, auth_index: String(i).padStart(16, "0") }));
@@ -181,7 +181,7 @@ test("credential workers run at most two reads concurrently and share the 15-sec
   assert.ok(h.calls.every(call => call.init.signal === h.calls[0].init.signal));
 });
 
-test("multi-credential management 401/403 stop queued reads and later selections, even with passive data", async () => {
+test("multi-credential management 401/403 stop queued reads and later selections", async () => {
   for (const status of [401, 403]) {
     let calls = 0;
     const files = Array.from({ length: 5 }, (_, i) => ({ ...codex, auth_index: String(i).padStart(16, "0") }));
@@ -196,7 +196,7 @@ test("multi-credential management 401/403 stop queued reads and later selections
   }
 });
 
-test("all worker reads stop at the common budget even if a transport ignores abort", async () => {
+test("all credential reads stop at the common budget even if a transport ignores abort", async () => {
   const controller = new AbortController();
   const files = Array.from({ length: 5 }, (_, i) => ({ ...codex, auth_index: String(i).padStart(16, "0") }));
   let budget;
@@ -240,4 +240,42 @@ test("management rejection cannot fall back to Claude passive windows or return 
   const result = await h.get();
   assert.match(result.error, /management access rejected/);
   assert.equal(result.windows, undefined);
+});
+
+
+test("an explicit Claude selection in a multi-credential CPA keeps resets while its windows stay aside", async () => {
+  for (const files of [[claude, codex], [claude, { ...claude, auth_index: "1123456789abcdef" }]]) {
+    const result = await harness(files).get(claude.auth_index);
+    assert.deepEqual(result.resets, { count: 1, each: [{ window: "fiveHour" }] });
+    assert.ok(result.windows.every(window => window.aside === true));
+    assert.equal((await harness(files).get()).resets, undefined);
+  }
+  for (const quota of [undefined, signals()]) {
+    const h = harness([claude, { ...codex, quota }]);
+    const result = await h.get(codex.auth_index);
+    assert.equal(result.plan, "plus");
+    assert.ok(result.windows.every(window => window.aside === true));
+    assert.equal((await h.get()).plan, undefined);
+  }
+});
+
+test("active Codex windows use relative reset seconds or omit unknown resets without dropping quota", async () => {
+  const base = { used_percent: 25, limit_window_seconds: 18000 };
+  for (const [resetFields, expected] of [
+    [{ reset_after_seconds: 3600 }, new Date(now + 3600000).toISOString()],
+    [{ reset_at: null, reset_after_seconds: 0 }, new Date(now).toISOString()],
+    [{}, undefined], [{ reset_at: null, reset_after_seconds: null }, undefined],
+    [{ reset_at: now / 1000 + 7200, reset_after_seconds: 3600 }, new Date(now + 7200000).toISOString()],
+  ]) {
+    const result = await harness([codex], { rate_limit: { primary_window: { ...base, ...resetFields } } }).get();
+    assert.equal(result.windows.length, 1);
+    assert.equal(result.windows[0].used, 25);
+    assert.equal(result.windows[0].span, 18000);
+    assert.equal(result.windows[0].resetsAt, expected);
+    assert.equal(Object.hasOwn(result.windows[0], "resetsAt"), expected !== undefined);
+  }
+  for (const reset_after_seconds of [-1, "3600", 8.64e12]) {
+    const result = await harness([codex], { rate_limit: { primary_window: { ...base, reset_after_seconds } } }).get();
+    assert.ok(result.error);
+  }
 });

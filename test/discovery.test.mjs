@@ -118,7 +118,8 @@ test("both model-list formats stop oversized chunked responses and cancel their 
       const format = new Headers(init.headers).has("anthropic-version") ? "anthropic" : "openai";
       return format === oversizedFormat ? new Response(stream) : Response.json(catalog([row]));
     });
-    await assert.rejects(discover(), /size limit/);
+    if (oversizedFormat === "openai") await assert.rejects(discover(), /size limit/);
+    else assert.deepEqual(await discover(), { [id]: { id, name: id } });
     assert.ok(cancelled);
     assert.ok(pulls <= 6);
     mock.mock.restore();
@@ -301,4 +302,27 @@ test("business rejection wins over the other list's transient failure, including
     ? { ok: false, status: 403, body: { cancel() { throw new Error("private"); } } }
     : new Response("temporary", { status: 500 }));
   await assert.rejects(discover(), error => error.signIn === "expired" && /403/.test(error.message));
+});
+
+
+test("Anthropic name-list failures degrade to IDs while OpenAI list failures remain fatal", async t => {
+  const failures = [
+    () => new Response("private", { status: 503 }),
+    () => { throw new TypeError("fetch failed"); },
+    () => { throw new DOMException("Timed out", "TimeoutError"); },
+    () => new Response("not JSON"),
+    () => Response.json({ data: {} }),
+  ];
+  for (const failure of failures) {
+    for (const rejectedFormat of ["openai", "anthropic"]) {
+      const mock = t.mock.method(globalThis, "fetch", async (_url, init) => {
+        const format = new Headers(init.headers).has("anthropic-version") ? "anthropic" : "openai";
+        return format === rejectedFormat ? failure() : Response.json(catalog([row, { id: "gpt-test" }]));
+      });
+      if (rejectedFormat === "openai") await assert.rejects(discover());
+      else assert.deepEqual(await discover(), { [id]: { id, name: id }, "gpt-test": { id: "gpt-test", name: "gpt-test" } });
+      assert.equal(mock.mock.callCount(), 2);
+      mock.mock.restore();
+    }
+  }
 });

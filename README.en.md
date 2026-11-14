@@ -37,7 +37,7 @@ Business and management keys are used separately but stored together in Magpie's
 
 The plugin's returned metadata does not contain the business key. Older hosts also copy sign-in answers into `metadata.businessKey` in the same file; newer hosts do not copy password answers.
 
-Models are named `cpa/<CPA model ID>`, such as `cpa/claude-sonnet-4-6`. Upstream IDs are preserved. The plugin forwards Messages, SSE, tool round trips and count_tokens through CPA's Anthropic-compatible API. Discovery reads original IDs from the OpenAI-format list and names from the Anthropic-format list in parallel, regardless of the credential mix. It excludes cloaking-encoded IDs starting with `claude-fable-5-dd-`. Magpie's model selection and allowlist control actual exposure. Non-Claude inference also uses the Anthropic API and has not been verified by this project; the plugin does not switch models to Responses.
+Models are named `cpa/<CPA model ID>`, such as `cpa/claude-sonnet-4-6`. Upstream IDs are preserved. The plugin forwards Messages, SSE, tool round trips and count_tokens through CPA's Anthropic-compatible API. Discovery reads original IDs from the OpenAI-format list and names from the Anthropic-format list in parallel, regardless of the credential mix. If the name list fails with anything other than 401/403, IDs serve as names. An OpenAI-list failure remains fatal, and 401/403 from either list marks sign-in expired. It excludes cloaking-encoded IDs starting with `claude-fable-5-dd-`. Magpie's model selection and allowlist control actual exposure. Non-Claude inference also uses the Anthropic API and has not been verified by this project; the plugin does not switch models to Responses.
 
 If a custom provider already owns `cpa`, Magpie changes the plugin's **effective ID** to `cpa-plugin`, producing `cpa-plugin/<ID>`. Check `magpie providers`, `magpie models`, or the gateway model catalog. `magpie plugin --json` may still show the self-reported ID `cpa`.
 
@@ -62,7 +62,7 @@ The total enabled count includes providers without quota support. Even when only
 
 Multi-credential window names are `<window> (<Claude|Codex> <label>)`, sorted by provider and label. Use `label` when present; if empty or containing `@` or control characters, use the first 8 characters of the opaque `auth_index`. Never use `name`, which often contains an email. Explicit selections use the same labels.
 
-At most two credential reads run concurrently for one management endpoint and key, within each call's shared 15-second budget. A failed credential gets a labeled text-only `aside` row while the others remain visible; only total failure returns an overall error. Management 401/403 always stops the whole read. Already-started parallel requests may finish, but queued requests do not start. Multiple credentials never show or combine reset cards.
+At most two credential reads run concurrently for one management endpoint and key, within each call's shared 15-second budget. A failed credential gets a labeled text-only `aside` row while the others remain visible; only total failure returns an overall error. Management 401/403 always stops the whole read. Already-started parallel requests may finish, but queued requests do not start. Reading multiple credentials never shows or combines reset cards. Reading just one credential, including an explicit selection in a pool, returns its `resets` and `plan` regardless of `aside`.
 
 Use `magpie quota --json` to inspect readings. Magpie omits `aside` from report JSON; its absence does not mean multi-credential windows participate in routing.
 
@@ -70,7 +70,7 @@ Use `magpie quota --json` to inspect readings. Magpie omits `aside` from report 
 
 Active reads send `GET https://chatgpt.com/backend-api/wham/usage` through CPA's management `api-call`, with `$TOKEN$` as the credential placeholder. When `/credentials` returns `id_token.chatgpt_account_id`, send it as `Chatgpt-Account-Id`; otherwise omit it without guessing the workspace.
 
-Only `rate_limit.primary_window` / `secondary_window` are parsed. Invalid windows are skipped; no valid window is an error. With a single credential, an allowlisted plan type is returned in usage `plan`, never in window names. Complete, unexpired primary and secondary `x-codex-*` signals observed by CPA within 5 minutes supply the windows without an active ChatGPT request. Relative resets start at CPA's observation time. Both active and passive paths have only been tested with mocks here.
+Only `rate_limit.primary_window` / `secondary_window` are parsed. Invalid windows are skipped; no valid window is an error. When reading just one credential, an allowlisted plan type is returned in usage `plan`, never in window names. Active reads prefer `reset_at`; when missing, add `reset_after_seconds` to the read time. If both are absent, keep the window without `resetsAt`. Complete, unexpired primary and secondary `x-codex-*` signals observed by CPA within 5 minutes supply the windows without an active ChatGPT request. Passive relative resets start at CPA's observation time. Both active and passive paths have only been tested with mocks here.
 
 `additional_rate_limits`, Codex reset cards, credits and subscription expiry are omitted. Community testing does not replace this project's acceptance against real CPA / ChatGPT.
 
