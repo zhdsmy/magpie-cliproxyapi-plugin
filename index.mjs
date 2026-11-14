@@ -443,6 +443,8 @@ export default async function CLIProxyAPIPlugin() {
         label: "CLIProxyAPI business API key",
         prompts: [
           { type: "text", key: "baseURL", message: "CPA Base URL", validate: validateURL },
+          { type: "password", key: "businessKey", message: "Business API key",
+            validate: value => typeof value === "string" && value.trim() ? undefined : "Business API key is required" },
           { type: "password", key: "managementKey", message: "Management key (optional, for usage)" },
           { type: "text", key: "managementURL", message: "Management URL (optional)",
             validate: value => validateURL(value, true) },
@@ -451,6 +453,8 @@ export default async function CLIProxyAPIPlugin() {
         async authorize(inputs) {
           try {
             const baseURL = normalizeURL(inputs?.baseURL);
+            const key = inputs?.businessKey?.trim();
+            if (!key) return { type: "failed", error: "Business API key is required" };
             const metadata = { baseURL, email: "cpa@" + new URL(baseURL).host };
             const managementURL = inputs?.managementURL?.trim();
             if (managementURL) metadata.managementURL = normalizeURL(managementURL);
@@ -458,8 +462,8 @@ export default async function CLIProxyAPIPlugin() {
               const value = inputs?.[field]?.trim();
               if (value) metadata[field] = value;
             }
-            // Magpie supplies the business key after authorize; API account labels use metadata.email.
-            return { type: "success", metadata };
+            // Return the prompted key explicitly; API account labels use metadata.email.
+            return { type: "success", key, metadata };
           } catch {
             return { type: "failed", error: "Invalid CPA or management URL" };
           }

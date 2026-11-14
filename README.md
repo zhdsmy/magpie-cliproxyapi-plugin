@@ -28,12 +28,16 @@ Magpie 服务运行中执行登录后，请运行 `magpie plugin on <安装时�
 | 字段 | 含义 |
 | --- | --- |
 | CPA Base URL | 必填，例如 `https://cpa.example.invalid`。允许尾部 `/v1`，会自动去掉；不允许 URL 用户信息、query 或 fragment。 |
+| Business API key | 必填，密码输入；CPA 业务 key，用于模型发现与推理。插件去掉首尾空白后返回给 Magpie。 |
 | Management key | 可选，密码输入；用于额度和 Claude 思考等级。不填仍可推理，但不查询管理接口，也不显示思考等级。 |
 | Management URL | 可选，**完整管理入口**，例如 `http://127.0.0.1:8317/v8/management`；默认 `<CPA Base URL>/v8/management`。 |
 | CPA credential | 可选，按 CPA 凭据的 `name` 或 `auth_index` 精确选择。 |
-| Business API key | Magpie 随后要求输入的 CPA 业务 key，用于模型发现与推理。 |
+
+业务 key 由插件的登录字段收集。新版 Magpie（已核对 v0.1.4139）不再单独询问 key；旧版（已核对 v0.1.2738、v0.1.3431）可能会再问一次，以插件收集的业务 key 为准。
 
 业务 key 与管理 key 分开使用，同存于 Magpie 的 `plugin-auth.json`，由宿主以 0600 权限保存。插件不读取 CPA 的 OAuth 文件。
+
+插件返回的 metadata 不含业务 key。旧版宿主会把登录回答额外复制到同一文件的 `metadata.businessKey`；新版宿主不复制 password 回答。
 
 模型名称为 `cpa/<CPA 模型 ID>`，例如 `cpa/claude-sonnet-4-6`。发给 CPA 的模型 ID 保持原样。插件通过 CPA 的 Anthropic 兼容接口转发 Messages、SSE、工具往返和 count_tokens。发现保留所有有效模型 ID，仅排除 `claude-fable-5-dd-` 开头的 cloaking 编码 ID；实际暴露范围由 Magpie 的模型选择与白名单控制。
 

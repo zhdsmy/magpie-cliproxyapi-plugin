@@ -26,12 +26,16 @@ After signing in while Magpie is running, run `magpie plugin on <installed packa
 | Field | Meaning |
 | --- | --- |
 | CPA Base URL | Required, e.g. `https://cpa.example.invalid`. A trailing `/v1` is removed. URL userinfo, query strings and fragments are rejected. |
+| Business API key | Required password input for the CPA business key, used for model discovery and inference. The plugin trims surrounding whitespace and returns it to Magpie. |
 | Management key | Optional password input for quota and Claude reasoning levels. Inference works without it; the plugin makes no management requests and shows no reasoning levels. |
 | Management URL | Optional **complete management endpoint**, e.g. `http://127.0.0.1:8317/v8/management`. Defaults to `<CPA Base URL>/v8/management`. |
 | CPA credential | Optional exact CPA credential `name` or `auth_index`. |
-| Business API key | The CPA business key requested next by Magpie, used for model discovery and inference. |
+
+The plugin's sign-in prompts collect the business key. Newer Magpie (source checked at v0.1.4139) does not ask for a separate key. Older versions (source checked at v0.1.2738 and v0.1.3431) may ask again; the key collected by the plugin takes precedence.
 
 Business and management keys are used separately but stored together in Magpie's `plugin-auth.json`, with mode 0600. The plugin does not read CPA OAuth files.
+
+The plugin's returned metadata does not contain the business key. Older hosts also copy sign-in answers into `metadata.businessKey` in the same file; newer hosts do not copy password answers.
 
 Models are named `cpa/<CPA model ID>`, such as `cpa/claude-sonnet-4-6`. Upstream IDs are preserved. The plugin forwards Messages, SSE, tool round trips and count_tokens through CPA's Anthropic-compatible API. Discovery keeps all valid model IDs except cloaking-encoded IDs starting with `claude-fable-5-dd-`. Magpie's model selection and allowlist control actual exposure.
 
