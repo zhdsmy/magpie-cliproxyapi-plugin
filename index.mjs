@@ -79,21 +79,80 @@ function usageWindows(data) {
   return windows;
 }
 
+const claudeUsageURL = "https://api.anthropic.com/api/oauth/usage";
+const claudeUsageHeader = { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20",
+  "User-Agent": "claude-cli/2.1.280 (external, cli)", Accept: "application/json" };
+const claudeGrantID = /^[a-z0-9_-]{1,40}$/;
+
+function optionalTime(value) {
+  if (value === undefined || value === null) return null;
+  const ms = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+}
+
+// Claude usage-limit reset grants ("Reset for free" in Claude Settings > Usage), read from the
+// opt-in `cedar_ember` block of the same usage response. Display only: grants are never claimed
+// (POST /api/organizations/{org}/reset_rate_limits is never sent). Like CPA's management center,
+// one malformed grant rejects the whole block, so a partial list is never shown as complete.
+function claudeResets(block, now) {
+  if (block === null || typeof block !== "object" || Array.isArray(block) || typeof block.eligible !== "boolean") return;
+  const grants = block.grants ?? [];
+  if (!Array.isArray(grants)) return;
+  const each = [];
+  const seen = new Set();
+  for (const grant of grants) {
+    if (grant === null || typeof grant !== "object") return;
+    const { id, resets_left: left, resets_total: total } = grant;
+    if (typeof id !== "string" || !claudeGrantID.test(id) || seen.has(id)) return;
+    seen.add(id);
+    if (!Number.isInteger(left) || left < 0 || left > 100) return;
+    if (total !== undefined && (!Number.isInteger(total) || total < left)) return;
+    const until = optionalTime(grant.ends_at);
+    if (until === undefined || optionalTime(grant.starts_at) === undefined) return;
+    if (!left || until && Date.parse(until) <= now) continue;
+    const window = grant.type === "session" ? "fiveHour" : grant.type === "weekly" ? "weekly" : undefined;
+    for (let i = 0; i < left; i++) {
+      const card = {};
+      if (until) card.until = until;
+      if (window) card.window = window;
+      each.push(card);
+    }
+  }
+  if (!each.length) return;
+  each.sort((a, b) => a.until === b.until ? 0 : a.until === undefined ? 1 : b.until === undefined ? -1
+    : a.until < b.until ? -1 : 1);
+  const resets = { count: each.length, each };
+  if (each[0].until) resets.until = each[0].until;
+  return resets;
+}
+
+async function readClaudeUsage(apiCall, _credential, { now }) {
+  let data;
+  try {
+    // One request for windows and grants: Anthropic rate-limits this endpoint hard.
+    data = await apiCall({ method: "GET", url: claudeUsageURL + "?cedar_ember=1", header: claudeUsageHeader });
+  } catch (error) {
+    // An account or client the opt-in query is refused for still gets its windows (as CodexBar does).
+    if (![400, 403].includes(error?.upstreamStatus)) throw error;
+    data = await apiCall({ method: "GET", url: claudeUsageURL, header: claudeUsageHeader });
+  }
+  const reading = { windows: usageWindows(data) };
+  const resets = claudeResets(data?.cedar_ember, now);
+  if (resets) reading.resets = resets;
+  return reading;
+}
+
 const usageAdapters = {
-  claude: {
-    request: {
-      method: "GET", url: "https://api.anthropic.com/api/oauth/usage",
-      header: { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": "claude-cli/2.1.280 (external, cli)", Accept: "application/json" },
-    },
-    parse: usageWindows,
-  },
+  claude: { read: readClaudeUsage },
 };
 
+function managementScope(base, metadata) {
+  return base + "|" + createHash("sha256").update(metadata.managementKey).digest("hex").slice(0, 12);
+}
+
 function createUsage({ request = (...args) => fetch(...args), now = () => Date.now(),
-  timeout = ms => AbortSignal.timeout(ms), adapters = usageAdapters } = {}) {
+  timeout = ms => AbortSignal.timeout(ms), adapters = usageAdapters, blocked = new Map() } = {}) {
   const cache = new Map();
-  const blocked = new Map();
   const render = entry => entry.value && (!entry.error || now() - entry.updatedAt <= 900_000)
     ? entry.value : { error: entry.error, signIn: "kept" };
   return async getAuth => {
@@ -106,7 +165,7 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
       const base = managementBase(metadata);
       const selection = metadata.credential ?? "";
       if (typeof selection !== "string") throw new UsageError("Check the CPA credential selection");
-      const scope = base + "|" + createHash("sha256").update(metadata.managementKey).digest("hex").slice(0, 12);
+      const scope = managementScope(base, metadata);
       if (blocked.has(scope)) return { error: blocked.get(scope), signIn: "kept" };
       const key = JSON.stringify([scope, selection]);
       let entry = cache.get(key);
@@ -148,15 +207,22 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
           if (typeof credential.auth_index !== "string" || !credential.auth_index.trim() || credential.auth_index.length > 128) {
             throw new UsageError("Invalid CPA auth_index; check the selected credential", { stale: false });
           }
-          const payload = await call("/requests/api-call", 256 << 10, {
-            ...adapter.request, auth_index: credential.auth_index,
-          });
-          if (payload?.status_code !== 200) {
-            throw new UsageError(payload?.status_code === 401 ? "CPA upstream credential rejected; refresh it in CPA"
-              : "CPA upstream usage request failed; retry later");
-          }
-          if (typeof payload.body !== "string") throw new UsageError("Invalid CPA usage response");
-          const windows = adapter.parse(JSON.parse(payload.body));
+          const apiCall = async template => {
+            const payload = await call("/requests/api-call", 256 << 10, {
+              ...template, auth_index: credential.auth_index,
+            });
+            if (payload?.status_code !== 200) {
+              const error = new UsageError(payload?.status_code === 401 ? "CPA upstream credential rejected; refresh it in CPA"
+                : "CPA upstream usage request failed; retry later");
+              error.upstreamStatus = payload?.status_code;
+              throw error;
+            }
+            if (typeof payload.body !== "string") throw new UsageError("Invalid CPA usage response");
+            return JSON.parse(payload.body);
+          };
+          const reading = adapter.read ? await adapter.read(apiCall, credential, { now: now() })
+            : { windows: adapter.parse(await apiCall(adapter.request)) };
+          const { windows } = reading;
           if (rows.length > 1) {
             const label = [credential.label, credential.name].find(value => typeof value === "string" && value.trim());
             for (const window of windows) {
@@ -165,6 +231,7 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
             }
           }
           entry.value = { windows, signIn: "kept" };
+          if (reading.resets) entry.value.resets = reading.resets;
           entry.updatedAt = now();
           entry.error = undefined;
         } catch (error) {
@@ -194,15 +261,23 @@ function reasoningLevels(definition) {
     .filter(Boolean))];
 }
 
-async function modelDefinitions(auth) {
+// Management 401/403 counts toward CPA's per-IP ban (5 failures, 30 minutes), so discovery
+// shares the usage hook's rejection breaker instead of retrying a rejected key on every refresh.
+async function modelDefinitions(auth, blocked = new Map()) {
   const metadata = auth?.metadata;
   if (typeof metadata?.managementKey !== "string" || !metadata.managementKey) return new Map();
   try {
+    const base = managementBase(metadata);
+    const scope = managementScope(base, metadata);
+    if (blocked.has(scope)) return new Map();
     const signal = AbortSignal.timeout(10_000);
-    const response = await fetch(managementBase(metadata) + "/routing/model-definitions/claude", {
+    const response = await fetch(base + "/routing/model-definitions/claude", {
       headers: managementHeaders(metadata), signal, redirect: "error",
     });
     if (!response.ok) {
+      if ([401, 403].includes(response.status)) {
+        blocked.set(scope, "CPA management access rejected; check key and remote access");
+      }
       await response.body?.cancel();
       return new Map();
     }
@@ -232,6 +307,7 @@ function applyReasoning(model, definition, configured) {
 }
 
 export default async function CLIProxyAPIPlugin() {
+  const rejectedManagement = new Map();
   return {
     async config(cfg) {
       cfg.provider ??= {};
@@ -239,7 +315,7 @@ export default async function CLIProxyAPIPlugin() {
     },
     auth: {
       provider: "cpa",
-      usage: createUsage(),
+      usage: createUsage({ blocked: rejectedManagement }),
       methods: [{
         type: "api",
         label: "CLIProxyAPI business API key",
@@ -283,7 +359,7 @@ export default async function CLIProxyAPIPlugin() {
       async models(provider, { auth } = {}) {
         if (auth?.type !== "api" || !auth.key) return {};
         const baseURL = normalizeURL(auth.metadata?.baseURL);
-        const definitionsPromise = modelDefinitions(auth);
+        const definitionsPromise = modelDefinitions(auth, rejectedManagement);
         const response = await fetch(baseURL + "/v1/models", {
           headers: { "x-api-key": auth.key, "anthropic-version": "2023-06-01" },
           signal: AbortSignal.timeout(10_000),

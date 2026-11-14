@@ -2,7 +2,7 @@
 
 [English](README.en.md)
 
-将 CLIProxyAPI（CPA）提供的模型接入 Magpie，并可选通过 CPA 管理接口查询凭据额度和 Claude 思考等级。目前额度适配器仅支持 Claude 的五小时、总周限已用百分比。无需额外 shim；OAuth 登录、Token 刷新和上游凭据选择均由 CPA 负责。
+将 CLIProxyAPI（CPA）提供的模型接入 Magpie，并可选通过 CPA 管理接口查询凭据额度和 Claude 思考等级。目前额度适配器仅支持 Claude：五小时、总周限已用百分比，以及账号持有的**重置卡**（Claude 设置 > 用量里的免费重置）。无需额外 shim；OAuth 登录、Token 刷新和上游凭据选择均由 CPA 负责。
 
 已验证 Magpie 0.1.2790 / 0.1.2826 与 CPA 8.0.51 的 Claude 链路。多供应商扩展仅经 mock 测试，非 Claude 后端的实际能力仍需自行验证。
 
@@ -58,9 +58,19 @@ CPA 只把其看到的 `127.0.0.1` / `::1` 视为本机。通常需要 Magpie �
 
 可用 `magpie quota --json` 查看读数。宿主报告 JSON 不输出 `aside` 字段，这不表示多凭据窗口参与路由。
 
+### Claude 重置卡
+
+额度请求为 `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1`，经 CPA 管理 `api-call` 发送。同一个响应同时带有窗口和 `cedar_ember` 重置卡清单，不增加请求次数。结果按 Magpie 原生的 `resets` 字段返回，账号卡片直接显示“↺ N 次重置”，悬停可看到最早到期时间和每张卡的到期时间，无需额外配置。
+
+- 插件**只读**：不调用 `POST /api/organizations/{org}/reset_rate_limits` 或 `/api/oauth/profile`，也不调用 CPA 的冷却重置接口，不会消耗重置卡。Magpie 只为内置 Codex 账号提供“使用重置”按钮，插件账号的重置卡仅展示；需要使用时，请在 CPA 管理面板的 Claude 额度卡片上操作。
+- 张数为各 grant 的 `resets_left` 之和，跳过已到期的 grant；`type` 为 `session` / `weekly` 时分别标为五小时 / 周重置。不可用（`eligible: false`、暂停、需先触顶）的 grant 仍计入持有数，是否能用以 CPA 管理面板为准。
+- 与 CPA 管理面板一致，任一 grant 格式异常就整块不显示，避免把不完整清单当作完整数量；窗口不受影响。卡片 ID 和标签不会返回给宿主。
+- 上游对带查询的请求返回 400/403 时，改用不带查询的请求重读一次，只显示窗口。其他状态不重试。
+- 资格由 Anthropic 服务端决定，可能与请求 UA（固定 `claude-cli/2.1.280`）有关；Anthropic 调整后可能需要更新插件。
+
 ## 鉴权失败与恢复
 
-CPA 对同一来源 IP 的管理鉴权失败累计 5 次会封禁 30 分钟，包括回环地址。插件遇到管理端 401/403 后，会停止对该管理入口和 key 的自动请求；改凭据选择不会解除停试。业务推理和业务账号状态不因额度错误而失效。
+CPA 对同一来源 IP 的管理鉴权失败累计 5 次会封禁 30 分钟，包括回环地址。插件遇到管理端 401/403 后（包括模型发现时读取思考等级），会停止对该管理入口和 key 的自动请求；改凭据选择不会解除停试。业务推理和业务账号状态不因额度错误而失效。
 
 先修正管理 key 和远程访问设置，再恢复查询：更换管理 key 或管理入口并重新登录，或在配置修好后重启运行插件的 Magpie 宿主进程。**仅修复 CPA 侧设置，然后以相同 key/入口重新登录，不会清除原进程的停试状态。** 停试状态仅在当前插件进程内维护；新 CLI 进程或重启可能重新尝试，因此不要用错误 key 反复启动查询。
 
@@ -107,6 +117,6 @@ magpie plugin rm '<installed-plugin-name>'
 npm test
 ```
 
-测试使用虚构 key 和本机 mock，不需要真实账号。当前 46 项显式测试；官方宿主联调另有隔离证据，不能代替真实 CPA 验收。
+测试使用虚构 key 和本机 mock，不需要真实账号。当前 58 项显式测试；官方宿主联调另有隔离证据，不能代替真实 CPA 验收。
 
 参考了 MIT 项目 [sub2api-magpie-plugin](https://github.com/FischelChern/sub2api-magpie-plugin) 的 Magpie 接入方式；本项目运行时代码独立实现，未复制其代码段。MIT 许可证见 [LICENSE](LICENSE)。

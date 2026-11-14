@@ -63,7 +63,7 @@ test("single enabled credential uses the exact api-call template and percentage 
   assert.equal(api.url, baseURL + "/v8/management/requests/api-call");
   assert.equal(api.init.method, "POST");
   assert.deepEqual(JSON.parse(api.init.body), {
-    auth_index: "index-one", method: "GET", url: "https://api.anthropic.com/api/oauth/usage",
+    auth_index: "index-one", method: "GET", url: "https://api.anthropic.com/api/oauth/usage?cedar_ember=1",
     header: { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20",
       "User-Agent": "claude-cli/2.1.280 (external, cli)", Accept: "application/json" },
   });

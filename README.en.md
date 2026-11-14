@@ -2,7 +2,7 @@
 
 [中文](README.md)
 
-Connect CLIProxyAPI (CPA) models to Magpie, with optional credential quota and Claude reasoning-level queries through CPA's management API. The current quota adapter supports Claude's five-hour and general weekly usage percentages. No extra shim is required. CPA handles OAuth sign-in, token refresh, and upstream credential selection.
+Connect CLIProxyAPI (CPA) models to Magpie, with optional credential quota and Claude reasoning-level queries through CPA's management API. The current quota adapter supports Claude: five-hour and general weekly usage percentages, plus the account's **reset cards** (the free resets in Claude Settings > Usage). No extra shim is required. CPA handles OAuth sign-in, token refresh, and upstream credential selection.
 
 The Claude path has been verified with Magpie 0.1.2790 / 0.1.2826 and CPA 8.0.51. The multi-provider extension has only been tested with mocks. Verify actual capabilities of non-Claude backends yourself.
 
@@ -56,9 +56,19 @@ The total enabled count includes providers without quota support. Even when only
 
 Use `magpie quota --json` to inspect readings. Magpie omits `aside` from report JSON; its absence does not mean multi-credential windows participate in routing.
 
+### Claude reset cards
+
+The quota request is `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1`, sent through CPA's management `api-call`. One response carries both the windows and the `cedar_ember` reset-card inventory, so no request is added. The result uses Magpie's native `resets` field: the account card shows "↺ N resets", with the soonest and per-card expiry on hover. No extra setup is needed.
+
+- The plugin is **read-only**. It never calls `POST /api/organizations/{org}/reset_rate_limits`, `/api/oauth/profile` or CPA's cooldown reset, so it never spends a card. Magpie offers "Use a reset" only for its built-in Codex accounts; a plugin account's cards are display-only. Spend them from the Claude quota card in the CPA management center.
+- The count is the sum of each grant's `resets_left`, skipping expired grants. `type` `session` / `weekly` is shown as a five-hour / weekly reset. Grants that cannot be used now (`eligible: false`, paused, or requiring a hit limit) still count as held; the CPA management center decides whether one can be spent.
+- As in the CPA management center, one malformed grant hides the whole block, so a partial list is never shown as the full count. Windows are unaffected. Grant IDs and labels are not returned to the host.
+- If upstream answers the query with 400/403, the plain usage request is read once instead, showing windows only. Other statuses are not retried.
+- Eligibility is decided by Anthropic and may depend on the request UA (fixed `claude-cli/2.1.280`); Anthropic changes may require a plugin update.
+
 ## Authentication failures and recovery
 
-CPA bans a source IP for 30 minutes after five management authentication failures, including loopback. After management HTTP 401/403, the plugin stops automatic requests for that endpoint and key. Changing only the credential selection does not unblock it. Quota errors do not invalidate business inference or the account's sign-in state.
+CPA bans a source IP for 30 minutes after five management authentication failures, including loopback. After management HTTP 401/403 (including the reasoning-level read during model discovery), the plugin stops automatic requests for that endpoint and key. Changing only the credential selection does not unblock it. Quota errors do not invalidate business inference or the account's sign-in state.
 
 Fix the management key and remote access settings first. Then sign in with a different management key or endpoint, or restart the Magpie plugin host after fixing the configuration. **Fixing CPA settings and signing in again with the same key and endpoint does not clear the running process's blocked state.** The state lives only in the plugin process; a new CLI process or restart can try again, so avoid repeatedly starting queries with a bad key.
 
@@ -104,6 +114,6 @@ Update clients and model groups that use `cpa/` or `cpa-plugin/` before removal.
 npm test
 ```
 
-Tests use fictional keys and local mocks; no real account is required. There are currently 46 explicit tests. Isolated official-host integration is separate evidence and does not replace real CPA acceptance.
+Tests use fictional keys and local mocks; no real account is required. There are currently 58 explicit tests. Isolated official-host integration is separate evidence and does not replace real CPA acceptance.
 
 The MIT project [sub2api-magpie-plugin](https://github.com/FischelChern/sub2api-magpie-plugin) informed the Magpie integration approach. This plugin's runtime was implemented independently without copying its code. See [LICENSE](LICENSE) for the MIT license.
