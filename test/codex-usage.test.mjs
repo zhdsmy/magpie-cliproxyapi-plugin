@@ -54,7 +54,7 @@ test("Codex uses wham via shared api-call, the management-center UA and optional
     assert.equal(h.calls[1].init.redirect, "error");
     assert.ok(!JSON.stringify(result).includes("fictional-workspace"));
     assert.equal((await h.get(codex.auth_index)).plan, "plus");
-    assert.equal(h.calls.length, 2, "selections share the upstream cache");
+    assert.equal(h.calls.length, 3, "selections share usage and reset inventory");
   }
 });
 
@@ -87,16 +87,16 @@ test("Codex skips malformed windows and errors when none is valid", async () => 
   assert.ok((await harness([codex], { additional_rate_limits: [{ rate_limit: data().rate_limit }] }).get()).error);
 });
 
-test("fresh complete Codex signals avoid wham, preserve plan and anchor relative resets to observation time", async () => {
+test("fresh complete Codex signals avoid usage reads, preserve plan and anchor relative resets to observation time", async () => {
   const h = harness([{ ...codex, quota: signals() }]);
   const result = await h.get();
-  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls.length, 2);
   assert.deepEqual(result.windows.map(w => [w.name, w.used, w.span]), [["5 hours", 12.5, 18000], ["7 days", 65, 604800]]);
   assert.equal(result.plan, "plus");
   h.advance(300000);
   const later = await h.get();
   assert.equal(later.windows[1].resetsAt, new Date(now + 7200000).toISOString());
-  assert.equal(h.calls.length, 2, "the five-minute boundary remains fresh");
+  assert.equal(h.calls.length, 3, "the five-minute boundary remains fresh; inventory stays cached");
 });
 
 test("old, future, partial, expired and malformed Codex signals fall back to wham", async () => {
@@ -109,7 +109,7 @@ test("old, future, partial, expired and malformed Codex signals fall back to wha
     const h = harness([{ ...codex, quota }]);
     const result = await h.get();
     assert.equal(result.windows[0].used, 25);
-    assert.equal(h.calls.length, 2);
+    assert.equal(h.calls.length, 3);
   }
 });
 
@@ -177,8 +177,10 @@ test("credential reads use the scope limit of two and share the 15-second signal
   }
   assert.equal((await reading).windows.length, 10);
   assert.equal(peak, 2);
-  assert.equal(h.calls.length, 6);
-  assert.ok(h.calls.every(call => call.init.signal === h.calls[0].init.signal));
+  assert.equal(h.calls.length, 11);
+  assert.ok(h.calls.every(call => call.init.signal instanceof AbortSignal));
+  assert.ok(h.calls.filter(call => !call.init.body || JSON.parse(call.init.body).url.endsWith("/wham/usage"))
+    .every(call => call.init.signal === h.calls[0].init.signal));
 });
 
 test("multi-credential management 401/403 stop queued reads and later selections", async () => {
@@ -226,7 +228,7 @@ test("the two-read limit also covers different selections refreshed together", a
   while (pending.length) { pending.shift()(); await turn(); }
   assert.ok((await results).every(result => result.windows.length === 2));
   assert.equal(peak, 2);
-  assert.equal(h.calls.length, 5, "all selections share one credential list");
+  assert.equal(h.calls.length, 9, "all selections share one credential list and each reads its inventory once");
 });
 
 test("management rejection cannot fall back to Claude passive windows or return a partial pool", async () => {

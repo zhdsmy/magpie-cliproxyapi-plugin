@@ -165,7 +165,7 @@ test("management definitions expose deduplicated levels and match dated or [1m] 
   assert.deepEqual(result[dated].variants, { low: {}, medium: {}, high: {} });
   assert.equal(result[dated].capabilities.reasoning, true);
   assert.deepEqual(result[legacy], { id: legacy, name: legacy });
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4);
   const modelCall = calls.find(([input, init]) => input.endsWith("/v1/models") && new Headers(init.headers).has("anthropic-version"));
   const definitionCall = calls.find(([input]) => input.endsWith("/routing/model-definitions/claude"));
   const modelHeaders = new Headers(modelCall[1].headers);
@@ -200,7 +200,7 @@ test("management definition failures downgrade without breaking discovery", asyn
     });
     const result = await discover({}, managementAuth);
     assert.deepEqual(result, { [id]: { id, name: id } });
-    assert.equal(mocked.mock.callCount(), 3);
+    assert.equal(mocked.mock.callCount(), 4);
     mocked.mock.restore();
   }
 });
@@ -218,7 +218,7 @@ test("explicit management URL uses the shared v8 routing base", async t => {
   });
   const result = await discover({}, explicitAuth);
   assert.deepEqual(result[id].variants, { low: {} });
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4);
   assert.ok(calls.some(([input]) => input === "https://cpa.example.invalid/v8/management/routing/model-definitions/claude"));
 });
 
@@ -240,7 +240,7 @@ test("a management rejection during discovery stops later usage reads with the s
   await instance.provider.models({}, { auth: managementAuth });
   const usage = await instance.auth.usage(() => managementAuth);
   assert.match(usage.error, /management access rejected/);
-  assert.equal(calls.filter(url => url.includes("/v8/management/")).length, 1);
+  assert.equal(calls.filter(url => url.includes("/v8/management/")).length, 2);
 });
 
 test("mixed pools always take original OpenAI IDs, regardless of cloaking or Claude credential presence", async t => {

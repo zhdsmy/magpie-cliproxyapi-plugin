@@ -3,7 +3,8 @@ import { once } from "node:events";
 
 export async function createMockCPA(port = 0, options = {}) {
   const state = { mode: "normal", managementMode: "normal", requests: [], cancellations: 0,
-    models: options.models ?? ["claude-sonnet-4-6"], used: options.used ?? 25, weekUsed: options.weekUsed ?? 50 };
+    models: options.models ?? ["claude-sonnet-4-6"], files: options.files, credentialModels: options.credentialModels,
+    used: options.used ?? 25, weekUsed: options.weekUsed ?? 50 };
   const server = createServer(async (request, response) => {
     const json = (status, body) => {
       response.writeHead(status, { "content-type": "application/json" });
@@ -21,6 +22,8 @@ export async function createMockCPA(port = 0, options = {}) {
       if (body.mode) state.mode = body.mode;
       if (body.managementMode) state.managementMode = body.managementMode;
       if (Array.isArray(body.models) && body.models.every(id => typeof id === "string")) state.models = body.models;
+      if (Array.isArray(body.files)) state.files = body.files;
+      if (body.credentialModels) state.credentialModels = body.credentialModels;
       if (Number.isFinite(body.used)) state.used = body.used;
       if (Number.isFinite(body.weekUsed)) state.weekUsed = body.weekUsed;
       return json(200, { mode: state.mode, managementMode: state.managementMode });
@@ -31,13 +34,38 @@ export async function createMockCPA(port = 0, options = {}) {
         return json(401, { error: "test management key rejected" });
       }
       if (state.managementMode === "unavailable") return json(503, { error: "test management unavailable" });
+      if (request.url.startsWith("/v8/management/routing/model-definitions/")) {
+        const codex = request.url.endsWith("/codex");
+        return json(200, { models: state.models.filter(id => id.startsWith("gpt-") === codex)
+          .map(id => ({ id, thinking: { levels: codex ? ["none", "low", "medium", "high", "xhigh"] : ["low", "high", "max"] } })) });
+      }
       if (request.url === "/v8/management/credentials") {
         const first = { provider: "claude", disabled: false, auth_index: "index-one", name: "one", label: "First" };
         const files = [first];
         if (state.managementMode === "multi") files.push({ ...first, auth_index: "index-two", name: "two", label: "Second" });
-        return json(200, { files });
+        return json(200, { files: state.files ?? files });
+      }
+      if (request.url.startsWith("/v8/management/credentials/models?")) {
+        const name = new URL(request.url, "http://localhost").searchParams.get("name");
+        return json(200, { models: (state.credentialModels?.[name] ?? []).map(id => ({ id })) });
       }
       if (request.url === "/v8/management/requests/api-call") {
+        const credential = state.files?.find(file => file.auth_index === body.auth_index);
+        if (credential?.provider === "codex") {
+          if (request.method !== "POST" || body.method !== "GET" || body.header?.Authorization !== "Bearer $TOKEN$") {
+            return json(400, { error: "invalid test Codex template" });
+          }
+          let data;
+          if (body.url === "https://chatgpt.com/backend-api/wham/usage") {
+            data = { plan_type: "plus", rate_limit: { primary_window: { used_percent: state.used,
+              limit_window_seconds: 18000, reset_at: Date.now() / 1000 + 3600 }, secondary_window: {
+              used_percent: state.weekUsed, limit_window_seconds: 604800, reset_at: Date.now() / 1000 + 86400 } } };
+          } else if (body.url === "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits") {
+            data = { available_count: 1, credits: [{ id: "fictional-card", status: "available",
+              reset_type: "codex_rate_limits", expires_at: new Date(Date.now() + 86400000).toISOString() }] };
+          } else return json(400, { error: "unexpected test Codex URL" });
+          return json(200, { status_code: 200, body: JSON.stringify(data) });
+        }
         const expected = { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20",
           "User-Agent": "claude-cli/2.1.280 (external, cli)", Accept: "application/json" };
         if (request.method !== "POST" || !["index-one", "index-two"].includes(body.auth_index) || body.method !== "GET" ||
@@ -54,11 +82,32 @@ export async function createMockCPA(port = 0, options = {}) {
     if (request.headers["x-api-key"] !== "test-biz-key-sandbox" &&
         request.headers.authorization !== "Bearer test-biz-key-sandbox") return json(401, { error: "test auth required" });
     if (request.url === "/v1/models") {
-      if (!request.headers["anthropic-version"]) return json(200, { object: "list", data: state.models.map(id => ({ id, object: "model" })) });
+      if (!request.headers["anthropic-version"]) return json(200, { object: "list", data: state.models.map(id => ({ id, object: "model",
+        owned_by: id.startsWith("gpt-") ? "openai" : "anthropic" })) });
       return json(200, { data: state.models.map(id => ({ id, type: "model", display_name: id })),
         has_more: false, first_id: state.models[0], last_id: state.models.at(-1) });
     }
     if (!state.models.includes(body.model)) return json(404, { type: "error", error: { type: "not_found_error", message: "test model not served" } });
+    if (request.url === "/v1/responses") {
+      if (request.headers.authorization !== "Bearer test-biz-key-sandbox") return json(401, { error: "test Bearer required" });
+      const item = { id: "msg_test", type: "message", status: "completed", role: "assistant",
+        content: [{ type: "output_text", text: "pong", annotations: [] }] };
+      const result = { id: "resp_test", object: "response", created_at: Math.floor(Date.now() / 1000),
+        model: body.model, status: "completed", output: [item], usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 } };
+      if (!body.stream) return json(200, result);
+      response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      let sequence_number = 0;
+      const emit = (type, fields) => response.write("event: " + type + "\ndata: " + JSON.stringify({ type, sequence_number: sequence_number++, ...fields }) + "\n\n");
+      emit("response.created", { response: { ...result, status: "in_progress", output: [] } });
+      emit("response.output_item.added", { output_index: 0, item: { ...item, status: "in_progress", content: [] } });
+      emit("response.content_part.added", { output_index: 0, item_id: item.id, content_index: 0, part: { ...item.content[0], text: "" } });
+      emit("response.output_text.delta", { output_index: 0, item_id: item.id, content_index: 0, delta: "pong" });
+      emit("response.output_text.done", { output_index: 0, item_id: item.id, content_index: 0, text: "pong" });
+      emit("response.content_part.done", { output_index: 0, item_id: item.id, content_index: 0, part: item.content[0] });
+      emit("response.output_item.done", { output_index: 0, item });
+      emit("response.completed", { response: result });
+      return response.end();
+    }
     if (request.url === "/v1/messages/count_tokens") return json(200, { input_tokens: 7 });
     if (request.url !== "/v1/messages") return json(404, { error: "not found" });
     if (state.mode === "503") return json(503, { type: "error", error: { type: "api_error", message: "test unavailable" } });

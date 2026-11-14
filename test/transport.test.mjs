@@ -53,7 +53,7 @@ test("authorize is local, normalizes metadata and returns the business key separ
   const method = hooks.auth.methods[0];
   assert.equal(method.type, "api");
   assert.deepEqual(method.prompts.map(({ key, type }) => [key, type]), [
-    ["baseURL", "text"], ["businessKey", "password"], ["managementKey", "password"], ["managementURL", "text"], ["credential", "text"],
+    ["baseURL", "text"], ["businessKey", "password"], ["managementKey", "password"], ["managementURL", "text"], ["credential", "text"], ["modelRouting", "select"],
   ]);
   const unexpected = t.mock.method(globalThis, "fetch", () => { throw new Error("Unexpected network request"); });
   const result = await method.authorize({

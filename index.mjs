@@ -209,15 +209,50 @@ function codexWindows(data, now) {
   return windows;
 }
 
-async function readCodexUsage(apiCall, credential, { now }) {
+function codexResets(block, now) {
+  if (!block || typeof block !== "object" || Array.isArray(block)) return;
+  const count = block.available_count;
+  if (!Number.isSafeInteger(count) || count <= 0) return;
+  const each = [];
+  const seen = new Set();
+  for (const credit of Array.isArray(block.credits) ? block.credits : []) {
+    if (credit?.status !== "available" || credit.reset_type !== "codex_rate_limits") continue;
+    if (typeof credit.id !== "string" || !credit.id.trim() || seen.has(credit.id)) return;
+    seen.add(credit.id);
+    const until = optionalTime(credit.expires_at);
+    if (!until || Date.parse(until) <= now) continue;
+    each.push({ until });
+  }
+  each.sort((a, b) => a.until.localeCompare(b.until));
+  return { count, byWindow: false, ...(each[0] ? { until: each[0].until } : {}),
+    ...(each.length === count ? { each } : {}) };
+}
+
+async function readCodexUsage(apiCall, credential, { now, memo, passive }) {
   const header = { Authorization: "Bearer $TOKEN$", "Content-Type": "application/json",
     "User-Agent": "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)" };
   const accountId = credential.id_token?.chatgpt_account_id;
   if (typeof accountId === "string" && accountId.trim() && !/[\r\n]/.test(accountId)) {
     header["Chatgpt-Account-Id"] = accountId.trim();
   }
-  const data = await apiCall({ method: "GET", url: "https://chatgpt.com/backend-api/wham/usage", header });
-  return { windows: codexWindows(data, now), plan: codexPlan(data?.plan_type) };
+  const data = passive ? undefined
+    : await apiCall({ method: "GET", url: "https://chatgpt.com/backend-api/wham/usage", header });
+  const windows = passive?.windows ?? codexWindows(data, now);
+  if (data?.rate_limit_reset_credits != null || !(memo.inventoryAt + inventoryTTL > now)) {
+    memo.inventoryAt = now;
+    memo.resets = undefined;
+    try {
+      const block = data?.rate_limit_reset_credits ?? await apiCall({ method: "GET",
+        url: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+        header: { ...header, Accept: "application/json", "OpenAI-Beta": "codex-1", Originator: "Codex Desktop" } }, 3_000);
+      memo.resets = codexResets(block, now);
+    } catch (error) {
+      if (error?.permanent) throw error;
+      // Inventory failures are remembered for 30 minutes; the windows remain usable.
+    }
+  }
+  return { windows, plan: passive?.plan ?? codexPlan(data?.plan_type),
+    resets: memo.resets, inventory: true, inventoryAt: memo.inventoryAt };
 }
 
 function codexSignalWindows(credential, now) {
@@ -241,7 +276,7 @@ function codexSignalWindows(credential, now) {
   try {
     const windows = codexWindows({ rate_limit });
     if (windows.length !== 2) return;
-    return { windows, observedAt, plan: codexPlan(signals.get("x-codex-plan-type")), inventory: false };
+    return { windows, observedAt, plan: codexPlan(signals.get("x-codex-plan-type")) };
   } catch { return; }
 }
 
@@ -268,7 +303,8 @@ function liveResets(resets, now) {
   if (!resets || !Array.isArray(resets.each)) return resets;
   const each = resets.each.filter(card => !card.until || Date.parse(card.until) > now);
   if (!each.length) return;
-  const live = { count: each.length, each };
+  const { until: _until, ...rest } = resets;
+  const live = { ...rest, count: each.length, each };
   if (each[0].until) live.until = each[0].until;
   return live;
 }
@@ -299,6 +335,7 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
     ? entry.value : { error: entry.error, signIn: "kept" };
   return async getAuth => {
     try {
+      const startedAt = now();
       const signal = timeout(15_000);
       const auth = await within(Promise.resolve().then(getAuth), signal);
       const metadata = auth?.metadata;
@@ -309,30 +346,51 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
       if (typeof selection !== "string") throw new UsageError("Check the CPA credential selection");
       const scope = managementScope(base, metadata);
       if (blocked.has(scope)) return { error: blocked.get(scope), signIn: "kept" };
-      const key = JSON.stringify([scope, selection]);
+      const modelRouting = metadata.modelRouting === "enabled";
+      const key = JSON.stringify([scope, selection, modelRouting]);
       let entry = cache.get(key);
       if (!entry) { entry = {}; cache.set(key, entry); }
       if (entry.pending) return await within(entry.pending, signal);
       if (entry.value && now() - entry.updatedAt < readTTL || now() < entry.retryAt) return render(entry);
-      const call = (path, maxBytes, body) => within((async () => {
+      const call = (path, maxBytes, body, optionalMs) => {
+        // Leave time to return valid windows if the optional inventory endpoint stalls.
+        if (optionalMs) {
+          optionalMs = Math.min(optionalMs, 14_000 - (now() - startedAt));
+          if (optionalMs <= 0) throw new UsageError("Optional CPA inventory budget exhausted");
+        }
+        const requestSignal = optionalMs ? AbortSignal.any([signal, timeout(optionalMs)]) : signal;
+        return within((async () => {
+          requestSignal.throwIfAborted();
+          if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
+          const response = await request(base + path, {
+            method: body === undefined ? "GET" : "POST",
+            headers: managementHeaders(metadata),
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            redirect: "error", signal: requestSignal,
+          });
+          if (response.status !== 200) {
+            const permanent = [401, 403].includes(response.status);
+            const message = permanent ? "CPA management access rejected; check key and remote access"
+              : "CPA management request failed (HTTP " + response.status + "); retry later";
+            if (permanent) blocked.set(scope, message);
+            try { await response.body?.cancel(); } catch {}
+            throw new UsageError(message, { permanent });
+          }
+          return readJSON(response, maxBytes);
+        })(), requestSignal);
+      };
+      const limited = async read => {
+        let release;
+        const active = activeReads.get(scope) ?? new Set();
+        activeReads.set(scope, active);
+        while (active.size >= 2) await within(Promise.race(active), signal);
         signal.throwIfAborted();
         if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
-        const response = await request(base + path, {
-          method: body === undefined ? "GET" : "POST",
-          headers: managementHeaders(metadata),
-          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-          redirect: "error", signal,
-        });
-        if (response.status !== 200) {
-          const permanent = [401, 403].includes(response.status);
-          const message = permanent ? "CPA management access rejected; check key and remote access"
-            : "CPA management request failed (HTTP " + response.status + "); retry later";
-          if (permanent) blocked.set(scope, message);
-          try { await response.body?.cancel(); } catch {}
-          throw new UsageError(message, { permanent });
-        }
-        return readJSON(response, maxBytes);
-      })(), signal);
+        const slot = new Promise(resolve => { release = resolve; });
+        active.add(slot);
+        try { return await read(); }
+        finally { active.delete(slot); release(); }
+      };
       // Accounts on one CPA refreshed together share a single credential list.
       const credentialList = () => {
         let list = lists.get(scope);
@@ -357,29 +415,23 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
         const passive = adapter.passive?.(credential, t);
         const last = state.reading;
         const age = last ? t - state.readAt : Infinity;
+        const inventoryAge = last ? t - (last.inventoryAt ?? state.readAt) : Infinity;
         const fromPassive = () => ({ windows: passive.windows,
           plan: passive.plan ?? last?.plan,
-          resets: age < inventoryTTL ? liveResets(last?.resets, t) : undefined });
+          resets: inventoryAge < inventoryTTL ? liveResets(last?.resets, t) : undefined });
         if (age < readTTL) {
           return passive && passive.observedAt > state.readAt ? fromPassive()
             : { windows: last.windows, plan: last.plan, resets: liveResets(last.resets, t) };
         }
-        if (passive && (passive.inventory === false || last && (!last.inventory || age < inventoryTTL))) return fromPassive();
+        if (passive && (passive.inventory === false || last && (!last.inventory || inventoryAge < inventoryTTL))) return fromPassive();
         if (!state.pending && t < state.retryAt) {
           if (passive) return fromPassive();
           throw state.error;
         }
         state.pending ??= (async () => {
-          let release, slot;
-          const active = activeReads.get(scope) ?? new Set();
-          activeReads.set(scope, active);
           try {
-            while (active.size >= 2) await within(Promise.race(active), signal);
-            signal.throwIfAborted();
-            if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
-            slot = new Promise(resolve => { release = resolve; });
-            active.add(slot);
-            const reading = await adapter.read(apiCall, credential, { now: t, memo: state.memo });
+            const reading = await limited(() => adapter.read(apiCall, credential, { now: t, memo: state.memo,
+              passive: passive && { ...passive, plan: passive.plan ?? last?.plan } }));
             Object.assign(state, { reading, readAt: now(), failures: 0, retryAt: 0, error: undefined });
             return reading;
           } catch (error) {
@@ -388,7 +440,6 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
             state.retryAt = now() + upstreamDelay(error, state.failures);
             throw error;
           } finally {
-            if (slot) { active.delete(slot); release(); }
             state.pending = undefined;
           }
         })();
@@ -414,16 +465,37 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
           if (rows.length > 1 && entry.value?.windows.some(window => !window.aside)) entry.value = undefined;
           matches.sort((a, b) => a.provider.localeCompare(b.provider) || credentialLabel(a).localeCompare(credentialLabel(b)) ||
             String(a.auth_index).localeCompare(String(b.auth_index)));
+          let exclusive;
+          if (modelRouting && !selection && rows.length > 1 && rows.every(supported)) {
+            const list = lists.get(scope);
+            list.models ??= Promise.all(rows.map(credential => limited(async () => {
+              const name = credential.name || credential.id;
+              if (typeof name !== "string" || !name.trim()) throw new UsageError("Missing CPA credential name or ID");
+              const payload = await call("/credentials/models?name=" + encodeURIComponent(name), 1 << 20);
+              if (!Array.isArray(payload?.models) || payload.models.some(model => typeof model?.id !== "string" || !model.id.trim())) {
+                throw new UsageError("Invalid CPA credential model list");
+              }
+              return new Set(payload.models.map(model => model.id.toLowerCase()));
+            })));
+            try {
+              const sets = await within(list.models, signal);
+              exclusive = new Map(rows.map((credential, index) => [credential.auth_index,
+                [...sets[index]].filter(id => sets.every((set, other) => other === index || !set.has(id)))]));
+            } catch (error) {
+              if (error?.permanent || blocked.has(scope)) throw error;
+              // Any unknown membership leaves the entire pool display-only for this list's 15s lifetime.
+            }
+          }
           const read = async credential => {
             if (!supported(credential)) throw new UsageError("Quota is not supported for this provider yet", { stale: false });
             const adapter = adapters[credential.provider];
             if (typeof credential.auth_index !== "string" || !credential.auth_index.trim() || credential.auth_index.length > 128) {
               throw new UsageError("Invalid CPA auth_index; check the selected credential", { stale: false });
             }
-            const apiCall = async template => {
+            const apiCall = async (template, optionalMs) => {
               const payload = await call("/requests/api-call", 256 << 10, {
                 ...template, auth_index: credential.auth_index,
-              });
+              }, optionalMs);
               if (payload?.status_code !== 200) {
                 const status = payload?.status_code;
                 const error = new UsageError(status === 401 ? "CPA upstream credential rejected; refresh it in CPA"
@@ -455,8 +527,10 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
           const windows = readings.flatMap(({ reading, error }, index) => {
             const label = credentialLabel(matches[index]);
             if (error) return [{ name: label, display: "Quota unavailable; check credential in CPA", aside: true }];
+            const models = exclusive?.get(matches[index].auth_index);
             return reading.windows.map(window => rows.length > 1
-              ? { ...window, name: window.name + " (" + label + ")", aside: true } : { ...window });
+              ? { ...window, name: window.name + " (" + label + ")",
+                ...(models?.length ? { models } : { aside: true }) } : { ...window });
           });
           entry.value = { windows, signIn: "kept" };
           if (matches.length === 1) {
@@ -495,7 +569,7 @@ function reasoningLevels(definition) {
 
 // Management 401/403 counts toward CPA's per-IP ban (5 failures, 30 minutes), so discovery
 // shares the usage hook's rejection breaker instead of retrying a rejected key on every refresh.
-async function modelDefinitions(auth, blocked = new Map()) {
+async function modelDefinitions(auth, blocked = new Map(), channel = "claude") {
   const metadata = auth?.metadata;
   if (typeof metadata?.managementKey !== "string" || !metadata.managementKey) return new Map();
   try {
@@ -503,7 +577,7 @@ async function modelDefinitions(auth, blocked = new Map()) {
     const scope = managementScope(base, metadata);
     if (blocked.has(scope)) return new Map();
     const signal = AbortSignal.timeout(10_000);
-    const response = await fetch(base + "/routing/model-definitions/claude", {
+    const response = await fetch(base + "/routing/model-definitions/" + channel, {
       headers: managementHeaders(metadata), signal, redirect: "error",
     });
     if (!response.ok) {
@@ -559,6 +633,9 @@ export default async function CLIProxyAPIPlugin() {
           { type: "text", key: "managementURL", message: "Management URL (optional)",
             validate: value => validateURL(value, true) },
           { type: "text", key: "credential", message: "CPA credential name or auth_index (optional)" },
+          { type: "select", key: "modelRouting",
+            message: "Model quota routing (enable only if no config API keys, openai-compatibility or plugins serve the same models)",
+            options: [{ label: "Disabled (default)", value: "disabled" }, { label: "Enabled", value: "enabled" }] },
         ],
         async authorize(inputs) {
           try {
@@ -572,6 +649,7 @@ export default async function CLIProxyAPIPlugin() {
               const value = inputs?.[field]?.trim();
               if (value) metadata[field] = value;
             }
+            if (inputs?.modelRouting === "enabled") metadata.modelRouting = "enabled";
             // Return the prompted key explicitly; API account labels use metadata.email.
             return { type: "success", key, metadata };
           } catch {
@@ -596,6 +674,7 @@ export default async function CLIProxyAPIPlugin() {
         if (auth?.type !== "api" || !auth.key) return {};
         const baseURL = normalizeURL(auth.metadata?.baseURL);
         const definitionsPromise = modelDefinitions(auth, rejectedManagement);
+        const codexDefinitionsPromise = modelDefinitions(auth, rejectedManagement, "codex");
         const signal = AbortSignal.timeout(10_000);
         const fetchModels = async headers => {
           const response = await fetch(baseURL + "/v1/models", { headers, signal, redirect: "error" });
@@ -612,12 +691,13 @@ export default async function CLIProxyAPIPlugin() {
           return payload.data;
         };
         // OpenAI lists original IDs; Anthropic supplies display names but may cloak non-Claude IDs.
-        const [lists, definitions] = await Promise.all([
+        const [lists, definitions, codexDefinitions] = await Promise.all([
           Promise.allSettled([
             fetchModels({ Authorization: "Bearer " + auth.key }),
             fetchModels({ "x-api-key": auth.key, "anthropic-version": "2023-06-01" }),
           ]),
           definitionsPromise,
+          codexDefinitionsPromise,
         ]);
         const failure = lists.find(result => result.status === "rejected" && result.reason?.signIn === "expired")
           ?? (lists[0].status === "rejected" ? lists[0] : undefined);
@@ -631,7 +711,9 @@ export default async function CLIProxyAPIPlugin() {
           if (typeof row?.id !== "string" || !row.id.trim()) continue;
           if (row.id.startsWith("claude-fable-5-dd-")) continue;
           const configured = provider?.models?.[row.id];
-          const definition = definitions.get(row.id) ?? definitions.get(definitionBase(row.id));
+          const codex = row.owned_by === "openai" && !row.id.startsWith("claude-");
+          const channel = codex ? codexDefinitions : definitions;
+          const definition = channel.get(row.id) ?? channel.get(definitionBase(row.id));
           const name = names.get(row.id);
           const model = { ...configured, id: row.id,
             name: typeof name === "string" && name ? name : row.id };
@@ -640,6 +722,7 @@ export default async function CLIProxyAPIPlugin() {
             const { id: _id, ...api } = model.api;
             model.api = api;
           }
+          if (codex) model.api = { ...model.api, npm: "@ai-sdk/openai" };
           Object.defineProperty(models, row.id, { value: model, enumerable: true, configurable: true, writable: true });
         }
         return models;

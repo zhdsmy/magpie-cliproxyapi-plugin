@@ -2,9 +2,9 @@
 
 [中文](README.md)
 
-A Magpie provider plugin for CLIProxyAPI (CPA). **This plugin focuses on Claude via CLIProxyAPI**: inference goes through CPA's Anthropic-compatible API, and with a management key the plugin also reads the Claude credential's five-hour and weekly usage, its **reset cards** (the free resets in Claude Settings > Usage) and model reasoning levels. No extra shim is required. CPA handles OAuth sign-in, token refresh and upstream credential selection.
+A Magpie provider plugin for CLIProxyAPI (CPA). **This plugin focuses on Claude via CLIProxyAPI**: Claude inference uses CPA's Anthropic-compatible API and identified Codex models use native Responses, and with a management key the plugin also reads the Claude credential's five-hour and weekly usage, its **reset cards** (the free resets in Claude Settings > Usage) and model reasoning levels. No extra shim is required. CPA handles OAuth sign-in, token refresh and upstream credential selection.
 
-Other providers' models served by CPA are still discovered and forwarded. Codex quota is a community contribution tested in the PR author's environment; this project has only run mock tests. Other non-Claude capabilities are unverified. If you need another provider, contributions and forks are welcome; see [Scope, contributing and forks](#scope-contributing-and-forks).
+Other providers' models served by CPA are still discovered and forwarded. Codex quota is a community contribution; Codex protocol, reasoning levels, reset cards and model routing are verified only with an isolated host and mock CPA. Other non-Claude capabilities are unverified. If you need another provider, contributions and forks are welcome; see [Scope, contributing and forks](#scope-contributing-and-forks).
 
 The Claude path has been verified with Magpie 0.1.2790 / 0.1.2826 and CPA 8.0.51. Reset-card display has only been tested with mocks so far.
 
@@ -27,9 +27,10 @@ After signing in while Magpie is running, run `magpie plugin on <installed packa
 | --- | --- |
 | CPA Base URL | Required, e.g. `https://cpa.example.invalid`. A trailing `/v1` is removed. URL userinfo, query strings and fragments are rejected. |
 | Business API key | Required password input for the CPA business key, used for model discovery and inference. The plugin trims surrounding whitespace and returns it to Magpie. |
-| Management key | Optional password input for quota and Claude reasoning levels. Inference works without it; the plugin makes no management requests and shows no reasoning levels. |
+| Management key | Optional password input for quota and Claude / Codex reasoning levels. Inference works without it; the plugin makes no management requests and shows no reasoning levels. |
 | Management URL | Optional **complete management endpoint**, e.g. `http://127.0.0.1:8317/v8/management`. Defaults to `<CPA Base URL>/v8/management`. |
 | CPA credential | Optional exact CPA credential `name` or `auth_index`. |
+| Model quota routing | Disabled by default. Enable only after confirming that no config API keys, openai-compatibility sources or plugins serve the same model IDs. |
 
 The plugin's sign-in prompts collect the business key. Newer Magpie (source checked at v0.1.4139) does not ask for a separate key. Older versions (source checked at v0.1.2738 and v0.1.3431) may ask again; the key collected by the plugin takes precedence.
 
@@ -37,7 +38,7 @@ Business and management keys are used separately but stored together in Magpie's
 
 The plugin's returned metadata does not contain the business key. Older hosts also copy sign-in answers into `metadata.businessKey` in the same file; newer hosts do not copy password answers.
 
-Models are named `cpa/<CPA model ID>`, such as `cpa/claude-sonnet-4-6`. Upstream IDs are preserved. The plugin forwards Messages, SSE, tool round trips and count_tokens through CPA's Anthropic-compatible API. Discovery reads original IDs from the OpenAI-format list and names from the Anthropic-format list in parallel, regardless of the credential mix. If the name list fails with anything other than 401/403, IDs serve as names. An OpenAI-list failure remains fatal, and 401/403 from either list marks sign-in expired. It excludes cloaking-encoded IDs starting with `claude-fable-5-dd-`. Magpie's model selection and allowlist control actual exposure. Non-Claude inference also uses the Anthropic API and has not been verified by this project; the plugin does not switch models to Responses.
+Models are named `cpa/<CPA model ID>`, such as `cpa/claude-sonnet-4-6`. Upstream IDs are preserved. The plugin forwards Messages, SSE, tool round trips and count_tokens through CPA's Anthropic-compatible API. Discovery reads original IDs from the OpenAI-format list and names from the Anthropic-format list in parallel, regardless of the credential mix. If the name list fails with anything other than 401/403, IDs serve as names. An OpenAI-list failure remains fatal, and 401/403 from either list marks sign-in expired. It excludes cloaking-encoded IDs starting with `claude-fable-5-dd-`. Magpie's model selection and allowlist control actual exposure. Models with `owned_by === "openai"` in the OpenAI-format list whose IDs do not start with `claude-` use CPA `/v1/responses`, with the business key as Bearer. CPA forces `store:false`; Magpie sends the full conversation each time. Other models retain the default Anthropic protocol. When multiple providers register the same ID, CPA takes `owned_by` from the last registration, so it cannot identify all backends for that ID. Check your pool configuration.
 
 If a custom provider already owns `cpa`, Magpie changes the plugin's **effective ID** to `cpa-plugin`, producing `cpa-plugin/<ID>`. Check `magpie providers`, `magpie models`, or the gateway model catalog. `magpie plugin --json` may still show the self-reported ID `cpa`.
 
@@ -47,7 +48,9 @@ The management key grants **full CPA management access, not read-only quota acce
 
 CPA considers only client addresses `127.0.0.1` and `::1` local. Normally Magpie and CPA must share a network namespace and use loopback. Otherwise, enable CPA `allow-remote` yourself. We recommend restricting sources with a firewall, tunnel or private network. Different Docker containers on one host, private addresses and Tailscale addresses normally count as remote. The plugin does not change these settings. **Exposing management to the public internet is discouraged.**
 
-Quota belongs to the selected upstream **credential account**, rather than a model or the entire CPA credential pool. Adapters are selected by the credential's `provider` field. Both `claude` and `codex` are supported. Claude keeps `5 hours` / `7 days`; Codex names windows by duration, such as `5 hours` / `7 days` / `30 days`. Windows report used percentages, spans and reset times, without monetary values or emails. The management API also supplies model reasoning levels for the Claude channel; models with non-empty definitions are marked as reasoning and expose those levels. The level request is `GET <management base>/routing/model-definitions/claude`. If a reverse-proxy allowlist fronts the management API, allow this path or levels will not appear. If the management API is unreachable, returns an error or no management key is configured, model discovery still succeeds without levels. Discovery alone does not imply quota or reasoning-level support.
+Quota belongs to the selected upstream **credential account**, rather than a model or the entire CPA credential pool. Adapters are selected by the credential's `provider` field. Both `claude` and `codex` are supported. Claude keeps `5 hours` / `7 days`; Codex names windows by duration, such as `5 hours` / `7 days` / `30 days`. Windows report used percentages, spans and reset times, without monetary values or emails. The management API also supplies model reasoning levels for the Claude / Codex channels; models with non-empty definitions are marked as reasoning and expose those levels. The level request is `GET <management base>/routing/model-definitions/claude` and `GET <management base>/routing/model-definitions/codex`. If a reverse-proxy allowlist fronts the management API, allow both paths or levels will not appear. If the management API is unreachable, returns an error or no management key is configured, model discovery still succeeds without levels. Discovery alone does not imply quota or reasoning-level support.
+
+The following table describes the default with model quota routing disabled.
 
 | Credential selection | Behavior |
 | --- | --- |
@@ -60,6 +63,14 @@ Quota belongs to the selected upstream **credential account**, rather than a mod
 
 The total enabled count includes providers without quota support. Even when only one can be queried, CPA may use a different credential for inference, so a multi-credential pool remains display-only.
 
+### Model quota routing (disabled by default)
+
+Only explicitly choosing Enabled for `Model quota routing` at sign-in saves `metadata.modelRouting: "enabled"`. Enable it only if CPA has no config API keys, openai-compatibility sources or plugins serving the same model IDs. Those sources do not appear in `/credentials`, so the plugin cannot prove they are absent.
+
+When enabled without an explicit credential selection, the plugin reads `GET <management base>/credentials/models?name=<name or ID>` for each enabled supported credential. Membership shares the credential list's 15-second cache and the same limit of two concurrent reads per management scope. A model appearing in exactly one list adds `models: [exclusive IDs]` to that credential's windows without `aside`. Exhaustion affects quota routing only for those models, rather than the whole CPA account. Magpie may still try its sole remaining candidate; a window is not a hard request limit. Shared models, credentials with no exclusive IDs and failed rows remain `aside`. Any failed list, or an unsupported enabled credential, leaves the entire pool `aside`. Management 401/403 still stops the scope. The sole enabled credential and explicit-selection rules stay the same.
+
+Risk: registrations can change between reads; the lists are not an atomic snapshot. Enabling this with unseen sources can misapply a credential's quota to routing. Keep the default disabled to retain the original display rules. A reverse-proxy allowlist must also allow this read-only path; no secret-bearing or write endpoints are needed.
+
 Multi-credential window names are `<window> (<Claude|Codex> <label>)`, sorted by provider and label. Use `label` when present; if empty or containing `@` or control characters, use the first 8 characters of the opaque `auth_index`. Never use `name`, which often contains an email. Explicit selections use the same labels.
 
 At most two credential reads run concurrently for one management endpoint and key, within each call's shared 15-second budget. A failed credential gets a labeled text-only `aside` row while the others remain visible; only total failure returns an overall error. Management 401/403 always stops the whole read. Already-started parallel requests may finish, but queued requests do not start. Reading multiple credentials never shows or combines reset cards. Reading just one credential, including an explicit selection in a pool, returns its `resets` and `plan` regardless of `aside`.
@@ -70,9 +81,11 @@ Use `magpie quota --json` to inspect readings. Magpie omits `aside` from report 
 
 Active reads send `GET https://chatgpt.com/backend-api/wham/usage` through CPA's management `api-call`, with `$TOKEN$` as the credential placeholder. When `/credentials` returns `id_token.chatgpt_account_id`, send it as `Chatgpt-Account-Id`; otherwise omit it without guessing the workspace.
 
-Only `rate_limit.primary_window` / `secondary_window` are parsed. Invalid windows are skipped; no valid window is an error. When reading just one credential, an allowlisted plan type is returned in usage `plan`, never in window names. Active reads prefer `reset_at`; when missing, add `reset_after_seconds` to the read time. If both are absent, keep the window without `resetsAt`. Complete, unexpired primary and secondary `x-codex-*` signals observed by CPA within 5 minutes supply the windows without an active ChatGPT request. Passive relative resets start at CPA's observation time. Both active and passive paths have only been tested with mocks here.
+Only `rate_limit.primary_window` / `secondary_window` are parsed. Invalid windows are skipped; no valid window is an error. When reading just one credential, an allowlisted plan type is returned in usage `plan`, never in window names. Active reads prefer `reset_at`; when missing, add `reset_after_seconds` to the read time. If both are absent, keep the window without `resetsAt`. Complete, unexpired primary and secondary `x-codex-*` signals observed by CPA within 5 minutes supply the windows without an active usage request. Passive relative resets start at CPA's observation time. Both active and passive paths have only been tested with mocks here.
 
-`additional_rate_limits`, Codex reset cards, credits and subscription expiry are omitted. Community testing does not replace this project's acceptance against real CPA / ChatGPT.
+Reset cards prefer `rate_limit_reset_credits` from usage. When absent, the plugin sends `GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits` through `api-call`. It only displays `resets`, never calls `consume` and never spends a card. Inventory is cached per credential for 30 minutes. Inventory failures, including 400/403/404, hide cards while keeping windows, with no retry for 30 minutes. Fresh passive windows need only an expired inventory read. The account header follows the usage rule; details add the management center's Accept, OpenAI-Beta and Originator headers. Per-card expiries appear only when their count matches the total. Multi-credential views omit cards.
+
+`additional_rate_limits`, wallet credits and subscription expiry are omitted. Real CPA / ChatGPT remain unverified.
 
 ### Claude reset cards
 
@@ -128,7 +141,7 @@ Update clients and model groups that use `cpa/` or `cpa-plugin/` before removal.
 
 ## Scope, contributing and forks
 
-The maintainer primarily uses and verifies Claude via CLIProxyAPI. Codex quota is a community contribution covered only by mock tests here; other provider features still depend on community contributions. Issues and pull requests are welcome, and so are forks that take the plugin in another direction under the MIT license.
+The maintainer primarily uses and verifies Claude via CLIProxyAPI. Codex quota is a community contribution, and Codex extensions are covered only by isolated-host and mock-CPA tests here; other provider features still depend on community contributions. Issues and pull requests are welcome, and so are forks that take the plugin in another direction under the MIT license.
 
 Pull requests should keep the plugin's rules:
 
@@ -143,7 +156,7 @@ To add a quota adapter for another provider:
 3. Return `{ windows, resets?, plan? }` in Magpie's usage shape, e.g. `{ name: "5 hours", used: 25, span: 18000, resetsAt: "2026-11-04T00:00:00.000Z" }`, where `used` is the percentage used and `span` is in seconds. Throw when no valid reading exists. Optionally implement `passive(credential, now)`, which derives `{ windows, observedAt }` from credential data CPA already returned, without an upstream request, and returns `undefined` when no reliable data exists. Adapters without reset inventories can return `inventory: false` so complete passive signals skip the active read.
 4. Shared management authentication, the 15-second budget, size limits, rejection blocking, per-credential shared caching, single-flight reads, backoff and multi-credential `aside` labels apply automatically.
 
-An unspecified selection reads all enabled supported credentials. A new adapter adds windows to mixed pools, but only a sole enabled credential participates in routing.
+An unspecified selection reads all enabled supported credentials. A new adapter adds windows to mixed pools. With model quota routing disabled, only a sole enabled credential participates in routing; see above for the enabled behavior.
 
 ## Development and acknowledgment
 
