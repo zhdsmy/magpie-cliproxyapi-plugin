@@ -11,14 +11,14 @@ const row = { id, type: "model", display_name: "Claude Sonnet", max_input_tokens
 const catalog = rows => ({ data: rows, has_more: false, first_id: rows[0]?.id ?? "", last_id: rows.at(-1)?.id ?? "" });
 const discover = async (provider = {}, currentAuth = auth) => (await plugin()).provider.models(provider, { auth: currentAuth });
 
-test("discovery requests Anthropic format and keeps original IDs and known capabilities", async t => {
+test("discovery requests both formats and keeps original IDs and known capabilities", async t => {
   const calls = [];
   t.mock.method(globalThis, "fetch", async (input, init) => {
     calls.push([input, init]);
     const headers = new Headers(init.headers);
     // CPA serves OpenAI format without the Anthropic header, even for Claude IDs.
     if (headers.get("anthropic-version") !== "2023-06-01") {
-      return Response.json({ object: "list", data: [{ id, object: "model", owned_by: "anthropic" }] });
+      return Response.json({ object: "list", data: [{ id, object: "model", owned_by: "anthropic" }, { id: "claude-new", object: "model" }] });
     }
     return Response.json(catalog([row, { ...row, id: "claude-new", display_name: "New Claude" }]));
   });
@@ -33,8 +33,8 @@ test("discovery requests Anthropic format and keeps original IDs and known capab
   assert.equal(result[id].api.id, undefined);
   assert.equal(known.api.id, "different-alias");
   assert.deepEqual(result["claude-new"], { id: "claude-new", name: "New Claude" });
-  assert.equal(calls.length, 1);
-  const [input, init] = calls[0];
+  assert.equal(calls.length, 2);
+  const [input, init] = calls.find(([, init]) => new Headers(init.headers).has("anthropic-version"));
   assert.equal(input, "https://cpa.example.invalid/v1/models");
   const headers = new Headers(init.headers);
   assert.equal(headers.get("x-api-key"), auth.key);
@@ -61,7 +61,7 @@ test("401 and 403 mark business sign-in expired without retrying", async t => {
   for (const status of [401, 403]) {
     const mocked = t.mock.method(globalThis, "fetch", async () => new Response("private error body", { status }));
     await assert.rejects(discover(), error => error.signIn === "expired" && !error.message.includes("private"));
-    assert.equal(mocked.mock.callCount(), 1);
+    assert.equal(mocked.mock.callCount(), 2);
     mocked.mock.restore();
   }
 });
@@ -73,7 +73,7 @@ test("500 and network failures throw ordinary errors for host fallback", async t
       return response;
     });
     await assert.rejects(discover(), error => !error.signIn && !error.message.includes("private"));
-    assert.equal(mocked.mock.callCount(), 1);
+    assert.equal(mocked.mock.callCount(), 2);
     mocked.mock.restore();
   }
 });
@@ -106,17 +106,23 @@ test("valid empty and cloaking-only catalogs are successful empty results", asyn
   }
 });
 
-test("oversized chunked responses stop reading and cancel the body", async t => {
-  let pulls = 0;
-  let cancelled = false;
-  const stream = new ReadableStream({
-    pull(controller) { pulls++; controller.enqueue(new Uint8Array(300000)); },
-    cancel() { cancelled = true; },
-  });
-  t.mock.method(globalThis, "fetch", async () => new Response(stream));
-  await assert.rejects(discover(), /size limit/);
-  assert.ok(cancelled);
-  assert.ok(pulls <= 6);
+test("both model-list formats stop oversized chunked responses and cancel their bodies", async t => {
+  for (const oversizedFormat of ["openai", "anthropic"]) {
+    let pulls = 0;
+    let cancelled = false;
+    const stream = new ReadableStream({
+      pull(controller) { pulls++; controller.enqueue(new Uint8Array(300000)); },
+      cancel() { cancelled = true; },
+    });
+    const mock = t.mock.method(globalThis, "fetch", async (_url, init) => {
+      const format = new Headers(init.headers).has("anthropic-version") ? "anthropic" : "openai";
+      return format === oversizedFormat ? new Response(stream) : Response.json(catalog([row]));
+    });
+    await assert.rejects(discover(), /size limit/);
+    assert.ok(cancelled);
+    assert.ok(pulls <= 6);
+    mock.mock.restore();
+  }
 });
 
 test("skips malformed rows and tolerates omitted type and has_more metadata", async t => {
@@ -158,8 +164,8 @@ test("management definitions expose deduplicated levels and match dated or [1m] 
   assert.deepEqual(result[dated].variants, { low: {}, medium: {}, high: {} });
   assert.equal(result[dated].capabilities.reasoning, true);
   assert.deepEqual(result[legacy], { id: legacy, name: legacy });
-  assert.equal(calls.length, 2);
-  const modelCall = calls.find(([input]) => input.endsWith("/v1/models"));
+  assert.equal(calls.length, 3);
+  const modelCall = calls.find(([input, init]) => input.endsWith("/v1/models") && new Headers(init.headers).has("anthropic-version"));
   const definitionCall = calls.find(([input]) => input.endsWith("/routing/model-definitions/claude"));
   const modelHeaders = new Headers(modelCall[1].headers);
   const definitionHeaders = new Headers(definitionCall[1].headers);
@@ -193,7 +199,7 @@ test("management definition failures downgrade without breaking discovery", asyn
     });
     const result = await discover({}, managementAuth);
     assert.deepEqual(result, { [id]: { id, name: id } });
-    assert.equal(mocked.mock.callCount(), 2);
+    assert.equal(mocked.mock.callCount(), 3);
     mocked.mock.restore();
   }
 });
@@ -211,14 +217,14 @@ test("explicit management URL uses the shared v8 routing base", async t => {
   });
   const result = await discover({}, explicitAuth);
   assert.deepEqual(result[id].variants, { low: {} });
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
   assert.ok(calls.some(([input]) => input === "https://cpa.example.invalid/v8/management/routing/model-definitions/claude"));
 });
 
 test("no management key skips model definitions", async t => {
   const mocked = t.mock.method(globalThis, "fetch", async () => Response.json(catalog([{ id }])));
   assert.deepEqual(await discover(), { [id]: { id, name: id } });
-  assert.equal(mocked.mock.callCount(), 1);
+  assert.equal(mocked.mock.callCount(), 2);
 });
 
 test("a management rejection during discovery stops later usage reads with the same key", async t => {
@@ -234,4 +240,65 @@ test("a management rejection during discovery stops later usage reads with the s
   const usage = await instance.auth.usage(() => managementAuth);
   assert.match(usage.error, /management access rejected/);
   assert.equal(calls.filter(url => url.includes("/v8/management/")).length, 1);
+});
+
+test("mixed pools always take original OpenAI IDs, regardless of cloaking or Claude credential presence", async t => {
+  for (const withClaude of [true, false]) {
+    for (const cloaked of [true, false]) {
+      const calls = [];
+      const ids = [...(withClaude ? [id] : []), "gpt-test", "gemini-test"];
+      const mock = t.mock.method(globalThis, "fetch", async (_url, init) => {
+        calls.push(init);
+        const anthropic = new Headers(init.headers).has("anthropic-version");
+        return Response.json({ data: ids.map(modelID => ({
+          id: anthropic && cloaked && !modelID.startsWith("claude-") ? "claude-fable-5-dd-" + modelID : modelID,
+          ...(anthropic ? { display_name: "Named " + modelID } : {}),
+        })).concat([{ id: "claude-fable-5-dd-never" }]) });
+      });
+      const result = await discover();
+      assert.deepEqual(Object.keys(result), ids);
+      for (const modelID of ids) assert.equal(result[modelID].id, modelID);
+      if (withClaude) assert.equal(result[id].name, "Named " + id);
+      assert.ok(!Object.keys(result).some(id => id.startsWith("claude-fable-5-dd-")));
+      assert.equal(calls.length, 2);
+      assert.equal(calls[0].signal, calls[1].signal);
+      assert.equal(new Headers(calls[0].headers).get("authorization"), "Bearer " + auth.key);
+      mock.mock.restore();
+    }
+  }
+});
+
+test("pure Claude discovery deep-equals the main model and thinking-level output", async t => {
+  const known = { limit: { context: 123456, output: 23456 }, api: { id: "alias", npm: "@ai-sdk/anthropic" } };
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    if (String(url).includes("/routing/")) return Response.json({ models: [
+      { id: "claude-sonnet-4-5", thinking: { levels: ["low", "high"] } },
+    ] });
+    return Response.json({ data: [{ id, ...(new Headers(init.headers).has("anthropic-version") ? { display_name: "Claude Sonnet" } : {}) }] });
+  });
+  assert.deepEqual(await discover({ models: { [id]: known } }, managementAuth), {
+    [id]: { id, name: "Claude Sonnet", limit: known.limit, api: { npm: "@ai-sdk/anthropic" },
+      variants: { low: {}, high: {} }, capabilities: { reasoning: true } },
+  });
+});
+
+test("either model-list format rejects business 401/403 instead of falling back to a partial list", async t => {
+  for (const status of [401, 403]) {
+    for (const rejectedFormat of ["openai", "anthropic"]) {
+      const mock = t.mock.method(globalThis, "fetch", async (_url, init) => {
+        const format = new Headers(init.headers).has("anthropic-version") ? "anthropic" : "openai";
+        return format === rejectedFormat ? new Response("private", { status }) : Response.json(catalog([row]));
+      });
+      await assert.rejects(discover(), error => error.signIn === "expired" && !error.message.includes("private"));
+      assert.equal(mock.mock.callCount(), 2);
+      mock.mock.restore();
+    }
+  }
+});
+
+test("business rejection wins over the other list's transient failure, including failed body cancellation", async t => {
+  t.mock.method(globalThis, "fetch", async (_url, init) => new Headers(init.headers).has("anthropic-version")
+    ? { ok: false, status: 403, body: { cancel() { throw new Error("private"); } } }
+    : new Response("temporary", { status: 500 }));
+  await assert.rejects(discover(), error => error.signIn === "expired" && /403/.test(error.message));
 });

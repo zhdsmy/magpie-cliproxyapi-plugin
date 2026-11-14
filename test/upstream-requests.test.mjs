@@ -63,7 +63,7 @@ test("shared readings are copied before the multi-credential label is added", as
   const h = harness({ files: [row, { ...row, provider: "other", auth_index: "x", name: "x" }] });
   for (const credential of ["one", "index-one", "one"]) {
     assert.deepEqual((await h.get(credential)).windows.map(w => w.name),
-      ["5 hours (credential First)", "7 days (credential First)"]);
+      ["5 hours (Claude First)", "7 days (Claude First)"]);
   }
   assert.equal(h.inner().length, 1);
 });

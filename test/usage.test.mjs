@@ -76,8 +76,8 @@ test("single enabled credential uses the exact api-call template and percentage 
   }
 });
 
-test("credential selection rejects zero, multiple unselected, missing, disabled and ambiguous matches", async () => {
-  for (const [files, selection] of [[[], ""], [[row, second], ""], [[row], "missing"],
+test("credential selection rejects zero, missing, disabled and ambiguous matches", async () => {
+  for (const [files, selection] of [[[], ""], [[row], "missing"],
     [[row, { ...second, disabled: true }], "two"], [[row, { ...second, name: "one" }], "one"],
     [[{ ...row, disabled: undefined }], ""], [[{ ...row, disabled: 0 }], ""]]) {
     const h = harness({ files });
@@ -86,16 +86,16 @@ test("credential selection rejects zero, multiple unselected, missing, disabled 
   }
 });
 
-test("selected multi-credential windows are display-only and use label/name, never email", async () => {
+test("selected multi-credential windows are display-only and use stable labels, never names or email", async () => {
   for (const credential of ["two", "index-two"]) {
     const h = harness({ files: [row, { ...second, email: "private-response-marker" }] });
     const result = await h.get({ credential });
     assert.equal(JSON.parse(h.calls[1].init.body).auth_index, "index-two");
-    assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("(credential Second)")));
+    assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("(Claude Second)")));
     assert.ok(!JSON.stringify(result).includes("private-response-marker"));
   }
   const h = harness({ files: [row, { ...second, label: undefined }] });
-  assert.match((await h.get({ credential: "two" })).windows[0].name, /credential two/);
+  assert.match((await h.get({ credential: "two" })).windows[0].name, /Claude index-tw/);
   const single = harness();
   assert.equal((await single.get({ credential: "one" })).windows[0].aside, undefined);
 });
@@ -276,12 +276,14 @@ test("inner failure never replaces a cached reading with its plausible body", as
   }
 });
 
-test("a newly ambiguous credential pool invalidates old routing windows", async () => {
+test("a newly multiple credential pool replaces old routing windows with aside windows", async () => {
   const h = harness();
   await h.get();
   h.advance(300_000);
   h.files = [row, second];
-  assertError(await h.get());
+  const result = await h.get();
+  assert.equal(result.windows.length, 4);
+  assert.ok(result.windows.every(window => window.aside === true));
 });
 
 test("cache is isolated by management key and endpoint; selections naming one credential share it", async () => {
@@ -416,21 +418,23 @@ test("automatic selection uses the sole enabled supported credential; a mixed po
     { ...second, auth_index: "disabled", disabled: true }] });
   const result = await h.get();
   assert.equal(JSON.parse(h.calls[1].init.body).auth_index, row.auth_index);
-  assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("(credential First)")));
+  assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("(Claude First)")));
 });
 
-test("several supported providers require an explicit unique selection and share the aside rule", async () => {
+test("several supported providers display all or the explicit selection with the aside rule", async () => {
   const adapter = { read: async apiCall => {
     await apiCall({ method: "GET", url: "https://usage.example.invalid/mock", header: {} });
     return { windows: [{ name: "Mock window", used: 10, span: 3600 }] };
   } };
   const h = harness({ adapters: { mockA: adapter, mockB: adapter },
     files: [{ ...row, provider: "mockA" }, { ...second, provider: "mockB" }] });
-  assertError(await h.get());
-  assert.equal(h.calls.length, 1);
+  const all = await h.get();
+  assert.equal(all.windows.length, 2);
+  assert.ok(all.windows.every(window => window.aside));
+  assert.equal(h.calls.length, 3);
   const result = await h.get({ credential: "index-two" });
-  assert.equal(JSON.parse(h.calls.at(-1).init.body).auth_index, "index-two");
-  assert.deepEqual(result.windows, [{ name: "Mock window (credential Second)", used: 10, span: 3600, aside: true }]);
+  assert.equal(h.calls.length, 3, "the explicit selection reuses its credential reading");
+  assert.deepEqual(result.windows, [{ name: "Mock window (mockB Second)", used: 10, span: 3600, aside: true }]);
   assert.equal(result.signIn, "kept");
 });
 
