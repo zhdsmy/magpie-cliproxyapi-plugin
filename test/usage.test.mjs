@@ -53,8 +53,8 @@ test("single enabled credential uses the exact api-call template and percentage 
   const h = harness({ files: [null, { ...row, provider: "other", disabled: true }, { ...row, disabled: true }, row] });
   const result = await h.get();
   assert.deepEqual(result, { signIn: "kept", windows: [
-    { name: "Claude/5h", used: 25, span: 18000, resetsAt: "2026-11-04T00:00:00.000Z" },
-    { name: "Claude/7d", used: 50, span: 604800, resetsAt: "2026-11-04T00:00:00.000Z" },
+    { name: "5 hours", used: 25, span: 18000, resetsAt: "2026-11-04T00:00:00.000Z" },
+    { name: "7 days", used: 50, span: 604800, resetsAt: "2026-11-04T00:00:00.000Z" },
   ] });
   assert.equal(h.calls.length, 2);
   const [credentials, api] = h.calls;
@@ -63,7 +63,7 @@ test("single enabled credential uses the exact api-call template and percentage 
   assert.equal(api.url, baseURL + "/v8/management/requests/api-call");
   assert.equal(api.init.method, "POST");
   assert.deepEqual(JSON.parse(api.init.body), {
-    auth_index: "index-one", method: "GET", url: "https://api.anthropic.com/api/oauth/usage",
+    auth_index: "index-one", method: "GET", url: "https://api.anthropic.com/api/oauth/usage?cedar_ember=1",
     header: { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20",
       "User-Agent": "claude-cli/2.1.280 (external, cli)", Accept: "application/json" },
   });
@@ -91,11 +91,11 @@ test("selected multi-credential windows are display-only and use label/name, nev
     const h = harness({ files: [row, { ...second, email: "private-response-marker" }] });
     const result = await h.get({ credential });
     assert.equal(JSON.parse(h.calls[1].init.body).auth_index, "index-two");
-    assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("/Second")));
+    assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("(credential Second)")));
     assert.ok(!JSON.stringify(result).includes("private-response-marker"));
   }
   const h = harness({ files: [row, { ...second, label: undefined }] });
-  assert.ok((await h.get({ credential: "two" })).windows[0].name.endsWith("/two"));
+  assert.match((await h.get({ credential: "two" })).windows[0].name, /credential two/);
   const single = harness();
   assert.equal((await single.get({ credential: "one" })).windows[0].aside, undefined);
 });
@@ -191,14 +191,14 @@ test("only valid known percentage windows survive; values over 100 are preserved
   const h = harness({ usage: envelope({ five_hour: window(125), seven_day: window(0, null),
     seven_day_sonnet: window(99), new_future_window: { anything: true }, limits: [{ unknown: true }] }) });
   assert.deepEqual((await h.get()).windows, [
-    { name: "Claude/5h", used: 125, span: 18000, resetsAt: "2026-11-04T00:00:00.000Z" },
-    { name: "Claude/7d", used: 0, span: 604800 },
+    { name: "5 hours", used: 125, span: 18000, resetsAt: "2026-11-04T00:00:00.000Z" },
+    { name: "7 days", used: 0, span: 604800 },
   ]);
   for (const invalid of [null, {}, window(-1), window("0"), window(true), window(null),
     window(1, null), window(0, "not-a-date"), { utilization: 0 }]) {
     const one = await harness({ usage: envelope({ five_hour: invalid, seven_day: window(10) }) }).get();
     assert.equal(one.windows.length, 1);
-    assert.equal(one.windows[0].name, "Claude/7d");
+    assert.equal(one.windows[0].name, "7 days");
     assertError(await harness({ usage: envelope({ five_hour: invalid }) }).get());
   }
   const body = '{"five_hour":{"utilization":1e999,"resets_at":"' + reset + '"}}';
@@ -238,7 +238,7 @@ test("five concurrent calls share exactly one credentials plus api-call pair", a
   assert.equal(h.calls.length, 2);
 });
 
-test("success cache expires at 300s; transient failure preserves at most 900s old readings without error", async () => {
+test("success cache expires at 300s; transient failure preserves at most 900s old readings; repeated failures back off", async () => {
   const h = harness();
   const first = await h.get();
   h.advance(299_999);
@@ -255,9 +255,15 @@ test("success cache expires at 300s; transient failure preserves at most 900s ol
   assert.deepEqual(await h.get(), first);
   h.advance(1);
   assertError(await h.get());
-  h.advance(300_000);
+  // The second upstream failure doubled the pause to 600s: CPA is asked, Anthropic is not.
   h.usage = envelope({ five_hour: window(5), seven_day: window(10) });
+  h.advance(300_000);
+  assertError(await h.get());
+  assert.equal(h.calls.length, 7);
+  assert.ok(h.calls.at(-1).url.endsWith("/credentials"));
+  h.advance(300_000);
   assert.equal((await h.get()).windows[0].used, 5);
+  assert.equal(h.calls.length, 9);
 });
 
 test("inner failure never replaces a cached reading with its plausible body", async () => {
@@ -278,16 +284,22 @@ test("a newly ambiguous credential pool invalidates old routing windows", async 
   assertError(await h.get());
 });
 
-test("cache is isolated by management key, endpoint and credential selection", async () => {
+test("cache is isolated by management key and endpoint; selections naming one credential share it", async () => {
   const h = harness();
   await h.get();
   for (const metadata of [{ managementKey: "test-mgmt-key-other" },
-    { managementURL: "https://management.example.invalid/private" }, { credential: "one" }]) {
+    { managementURL: "https://management.example.invalid/private" }]) {
     await h.get(metadata);
   }
-  assert.equal(h.calls.length, 8);
+  assert.equal(h.calls.length, 6);
+  // "", the name and the auth_index all resolve to index-one: one credential list, one upstream read.
+  for (const credential of ["one", "index-one"]) assert.equal((await h.get({ credential })).windows[0].used, 25);
   await h.get();
-  assert.equal(h.calls.length, 8);
+  assert.equal(h.calls.length, 6);
+  h.advance(15_000);
+  await h.get({ credential: "other-selection-same-scope" });
+  assert.equal(h.calls.length, 7);
+  assert.ok(h.calls.at(-1).url.endsWith("/credentials"));
 });
 
 test("management credentials stay at the explicit management endpoint, never the OAuth target", async () => {
@@ -365,17 +377,21 @@ test("real management redirects are rejected without sending the key to their ta
 
 test("provider adapter dispatches its own request template and parser through the shared cache", async () => {
   let parsed = 0;
+  const template = { method: "GET", url: "https://usage.example.invalid/mock",
+    header: { Authorization: "Bearer $TOKEN$", Accept: "application/json" } };
   const adapter = {
-    request: { method: "GET", url: "https://usage.example.invalid/mock",
-      header: { Authorization: "Bearer $TOKEN$", Accept: "application/json" } },
-    parse(body) { parsed++; assert.deepEqual(body, { percent: 17 });
-      return [{ name: "Mock window", used: body.percent, span: 3600 }]; },
+    async read(apiCall, credential) {
+      assert.equal(credential.auth_index, row.auth_index);
+      const body = await apiCall(template);
+      parsed++; assert.deepEqual(body, { percent: 17 });
+      return { windows: [{ name: "Mock window", used: body.percent, span: 3600 }] };
+    },
   };
   const h = harness({ adapters: { mock: adapter }, files: [{ ...row, provider: "mock" }],
     usage: envelope({ percent: 17 }) });
   const result = await h.get();
   assert.deepEqual(result, { signIn: "kept", windows: [{ name: "Mock window", used: 17, span: 3600 }] });
-  assert.deepEqual(JSON.parse(h.calls[1].init.body), { ...adapter.request, auth_index: row.auth_index });
+  assert.deepEqual(JSON.parse(h.calls[1].init.body), { ...template, auth_index: row.auth_index });
   assert.equal(new Headers(h.calls[1].init.headers).get("authorization"), "Bearer " + managementKey);
   assert.deepEqual(await h.get(), result);
   assert.equal(parsed, 1);
@@ -400,12 +416,14 @@ test("automatic selection uses the sole enabled supported credential; a mixed po
     { ...second, auth_index: "disabled", disabled: true }] });
   const result = await h.get();
   assert.equal(JSON.parse(h.calls[1].init.body).auth_index, row.auth_index);
-  assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("/First")));
+  assert.ok(result.windows.every(w => w.aside === true && w.name.endsWith("(credential First)")));
 });
 
 test("several supported providers require an explicit unique selection and share the aside rule", async () => {
-  const adapter = { request: { method: "GET", url: "https://usage.example.invalid/mock", header: {} },
-    parse: () => [{ name: "Mock window", used: 10, span: 3600 }] };
+  const adapter = { read: async apiCall => {
+    await apiCall({ method: "GET", url: "https://usage.example.invalid/mock", header: {} });
+    return { windows: [{ name: "Mock window", used: 10, span: 3600 }] };
+  } };
   const h = harness({ adapters: { mockA: adapter, mockB: adapter },
     files: [{ ...row, provider: "mockA" }, { ...second, provider: "mockB" }] });
   assertError(await h.get());
@@ -426,8 +444,10 @@ test("unsupported selection replaces old quota with an error instead of reusing 
 });
 
 test("new adapters retain the common management rejection circuit breaker", async () => {
-  const h = harness({ adapters: { mock: { request: { method: "GET", url: "https://usage.example.invalid/mock" },
-    parse: () => { throw new Error("must not parse rejected response"); } } }, files: [{ ...row, provider: "mock" }],
+  const h = harness({ adapters: { mock: { read: async apiCall => {
+    await apiCall({ method: "GET", url: "https://usage.example.invalid/mock" });
+    throw new Error("must not parse rejected response");
+  } } }, files: [{ ...row, provider: "mock" }],
     request: (url, _init, h) => url.endsWith("/credentials") ? Response.json({ files: h.files })
       : new Response("private-response-marker", { status: 403 }) });
   for (let i = 0; i < 10; i++) { assertError(await h.get()); h.advance(1_800_000); }

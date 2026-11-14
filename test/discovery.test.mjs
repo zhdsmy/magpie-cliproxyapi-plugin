@@ -220,3 +220,18 @@ test("no management key skips model definitions", async t => {
   assert.deepEqual(await discover(), { [id]: { id, name: id } });
   assert.equal(mocked.mock.callCount(), 1);
 });
+
+test("a management rejection during discovery stops later usage reads with the same key", async t => {
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async input => {
+    calls.push(String(input));
+    if (String(input).includes("/v8/management/")) return new Response("denied", { status: 401 });
+    return Response.json(catalog([row]));
+  });
+  const instance = await plugin();
+  await instance.provider.models({}, { auth: managementAuth });
+  await instance.provider.models({}, { auth: managementAuth });
+  const usage = await instance.auth.usage(() => managementAuth);
+  assert.match(usage.error, /management access rejected/);
+  assert.equal(calls.filter(url => url.includes("/v8/management/")).length, 1);
+});

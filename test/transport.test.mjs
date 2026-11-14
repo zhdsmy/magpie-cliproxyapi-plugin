@@ -47,7 +47,7 @@ test("config registers only cpa and preserves existing configuration", async () 
   assert.deepEqual(custom.provider.other, {});
 });
 
-test("authorize is local and returns the business key separately from metadata", async t => {
+test("authorize is local, normalizes metadata and returns the business key separately", async t => {
   const hooks = await plugin();
   assert.equal(hooks.auth.provider, "cpa");
   const method = hooks.auth.methods[0];
@@ -57,7 +57,7 @@ test("authorize is local and returns the business key separately from metadata",
   ]);
   const unexpected = t.mock.method(globalThis, "fetch", () => { throw new Error("Unexpected network request"); });
   const result = await method.authorize({
-    baseURL: "https://cpa.example.invalid:8317/v1/", businessKey: bizKey,
+    baseURL: "https://cpa.example.invalid:8317/v1/", businessKey: " " + bizKey + " ",
     managementURL: "https://management.example.invalid/v8/management/",
     managementKey: " " + managementKey + " ", credential: " credential-one ",
   });
@@ -65,12 +65,21 @@ test("authorize is local and returns the business key separately from metadata",
     baseURL: "https://cpa.example.invalid:8317", email: "cpa@cpa.example.invalid:8317",
     managementURL: "https://management.example.invalid/v8/management", managementKey, credential: "credential-one",
   } });
+  assert.ok(!("businessKey" in result.metadata));
+  assert.ok(!("key" in result.metadata));
   assert.ok(!JSON.stringify(result.metadata).includes(bizKey));
   assert.deepEqual(await method.authorize({ baseURL, businessKey: bizKey }), { type: "success", key: bizKey, metadata: {
     baseURL, email: "cpa@cpa.example.invalid",
   } });
   assert.deepEqual(await method.authorize({ baseURL, businessKey: bizKey, managementKey: " ", managementURL: " ", credential: " " }),
     await method.authorize({ baseURL, businessKey: bizKey }));
+  const keyPrompt = method.prompts[1];
+  for (const businessKey of [undefined, "", " \t\n "]) {
+    assert.equal(keyPrompt.validate(businessKey), "Business API key is required");
+    assert.deepEqual(await method.authorize({ baseURL, businessKey }),
+      { type: "failed", error: "Business API key is required" });
+  }
+  assert.equal(keyPrompt.validate(" " + bizKey + " "), undefined);
   assert.equal((await method.authorize({ baseURL })).type, "failed");
   assert.equal((await method.authorize({ baseURL, businessKey: bizKey, managementURL: "https://user:secret@example.invalid" })).type, "failed");
   assert.equal((await method.authorize({ baseURL: "not-a-url", businessKey: bizKey })).type, "failed");

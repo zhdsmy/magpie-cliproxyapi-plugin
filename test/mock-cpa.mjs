@@ -41,7 +41,7 @@ export async function createMockCPA(port = 0, options = {}) {
         const expected = { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20",
           "User-Agent": "claude-cli/2.1.280 (external, cli)", Accept: "application/json" };
         if (request.method !== "POST" || !["index-one", "index-two"].includes(body.auth_index) || body.method !== "GET" ||
-            body.url !== "https://api.anthropic.com/api/oauth/usage" ||
+            body.url !== "https://api.anthropic.com/api/oauth/usage?cedar_ember=1" ||
             Object.keys(body.header ?? {}).length !== 4 || Object.entries(expected).some(([k, v]) => body.header?.[k] !== v)) {
           return json(400, { error: "invalid test api-call template" });
         }

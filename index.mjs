@@ -79,43 +79,149 @@ function usageWindows(data) {
   return windows;
 }
 
+const claudeUsageURL = "https://api.anthropic.com/api/oauth/usage";
+const claudeUsageHeader = { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20",
+  "User-Agent": "claude-cli/2.1.280 (external, cli)", Accept: "application/json" };
+const claudeGrantID = /^[a-z0-9_-]{1,40}$/;
+
+function optionalTime(value) {
+  if (value === undefined || value === null) return null;
+  const ms = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+}
+
+// Claude usage-limit reset grants ("Reset for free" in Claude Settings > Usage), read from the
+// opt-in `cedar_ember` block of the same usage response. Display only: grants are never claimed
+// (POST /api/organizations/{org}/reset_rate_limits is never sent). Like CPA's management center,
+// one malformed grant rejects the whole block, so a partial list is never shown as complete.
+function claudeResets(block, now) {
+  if (block === null || typeof block !== "object" || Array.isArray(block) || typeof block.eligible !== "boolean") return;
+  const grants = block.grants ?? [];
+  if (!Array.isArray(grants)) return;
+  const each = [];
+  const seen = new Set();
+  for (const grant of grants) {
+    if (grant === null || typeof grant !== "object") return;
+    const { id, resets_left: left, resets_total: total } = grant;
+    if (typeof id !== "string" || !claudeGrantID.test(id) || seen.has(id)) return;
+    seen.add(id);
+    if (!Number.isInteger(left) || left < 0 || left > 100) return;
+    if (total !== undefined && (!Number.isInteger(total) || total < left)) return;
+    const until = optionalTime(grant.ends_at);
+    if (until === undefined || optionalTime(grant.starts_at) === undefined) return;
+    if (!left || until && Date.parse(until) <= now) continue;
+    const window = grant.type === "session" ? "fiveHour" : grant.type === "weekly" ? "weekly" : undefined;
+    for (let i = 0; i < left; i++) {
+      const card = {};
+      if (until) card.until = until;
+      if (window) card.window = window;
+      each.push(card);
+    }
+  }
+  if (!each.length) return;
+  each.sort((a, b) => a.until === b.until ? 0 : a.until === undefined ? 1 : b.until === undefined ? -1
+    : a.until < b.until ? -1 : 1);
+  const resets = { count: each.length, each };
+  if (each[0].until) resets.until = each[0].until;
+  return resets;
+}
+
+async function readClaudeUsage(apiCall, _credential, { now, memo = {} }) {
+  const plain = () => apiCall({ method: "GET", url: claudeUsageURL, header: claudeUsageHeader });
+  let data;
+  let inventory = !(memo.plainUntil > now);
+  if (!inventory) {
+    data = await plain();
+  } else {
+    try {
+      // One request for windows and grants: Anthropic rate-limits this endpoint hard.
+      data = await apiCall({ method: "GET", url: claudeUsageURL + "?cedar_ember=1", header: claudeUsageHeader });
+    } catch (error) {
+      // An account or client the opt-in query is refused for still gets its windows (as CodexBar does),
+      // and later reads skip the refused query for a day instead of paying two requests each time.
+      if (![400, 403].includes(error?.upstreamStatus)) throw error;
+      data = await plain();
+      memo.plainUntil = now + 86_400_000;
+      inventory = false;
+    }
+  }
+  const reading = { windows: usageWindows(data), inventory };
+  const resets = claudeResets(data?.cedar_ember, now);
+  if (resets) reading.resets = resets;
+  return reading;
+}
+
+const readTTL = 300_000;
+const inventoryTTL = 1_800_000;
+const signalMaxAge = 300_000;
+
+// Anthropic's unified rate-limit headers, which CPA keeps per credential from its latest real
+// inference response (`quota.signals` in /credentials). Utilization is a 0-1 share and reset a
+// Unix time in seconds. Only a recent, complete and unexpired 5-hour plus 7-day pair is used,
+// so these windows cost no Anthropic request at all.
+function claudeSignalWindows(credential, now) {
+  const quota = credential?.quota;
+  const observedAt = typeof quota?.observed_at === "string" ? Date.parse(quota.observed_at) : NaN;
+  if (!Number.isFinite(observedAt) || now - observedAt > signalMaxAge || observedAt - now > 60_000) return;
+  if (quota.signals === null || typeof quota.signals !== "object") return;
+  const signals = new Map();
+  for (const [key, value] of Object.entries(quota.signals)) {
+    if (typeof value === "string") signals.set(key.toLowerCase(), value.trim());
+  }
+  const windows = [];
+  for (const [key, name, span] of [["5h", "5 hours", 18000], ["7d", "7 days", 604800]]) {
+    const used = signals.get("anthropic-ratelimit-unified-" + key + "-utilization") ?? "";
+    const reset = signals.get("anthropic-ratelimit-unified-" + key + "-reset") ?? "";
+    if (!/^\d{1,6}(\.\d{1,9})?$/.test(used) || !/^\d{1,12}(\.\d{1,9})?$/.test(reset)) return;
+    const resetsAt = Math.round(Number(reset) * 1000);
+    if (resetsAt <= now || resetsAt > 8.64e15) return;
+    windows.push({ name, used: Math.round(Number(used) * 10_000) / 100, span, resetsAt: new Date(resetsAt).toISOString() });
+  }
+  return { windows, observedAt };
+}
+
+// Quota adapters keyed by CPA's `files[].provider`. read(apiCall, credential, { now, memo }) returns
+// { windows, resets?, inventory? } where apiCall sends one inner request through CPA's management
+// api-call and memo persists per credential; passive(credential, now) may return { windows,
+// observedAt } from data CPA already holds, without any upstream request.
 const usageAdapters = {
-  codex: {
-    request: {
-      method: "GET", url: "https://chatgpt.com/backend-api/wham/usage",
-      header: { Authorization: "Bearer $TOKEN$", Accept: "application/json" },
-    },
-    parse(data) {
-      const plan = typeof data?.plan_type === "string" && /^[a-z0-9_-]{1,30}$/i.test(data.plan_type) ? data.plan_type : "unknown";
-      const windows = [];
-      for (const row of [data?.rate_limit?.primary_window, data?.rate_limit?.secondary_window]) {
-        if (!row || typeof row.used_percent !== "number" || !Number.isFinite(row.used_percent) || row.used_percent < 0 ||
-            !Number.isSafeInteger(row.limit_window_seconds) || row.limit_window_seconds <= 0) continue;
-        const days = row.limit_window_seconds / 86400;
-        const hours = row.limit_window_seconds / 3600;
-        const duration = Number.isInteger(days) ? days + "d" : Number.isInteger(hours) ? hours + "h" : row.limit_window_seconds + "s";
-        const window = { name: plan[0].toUpperCase() + plan.slice(1) + "/" + duration, used: row.used_percent, span: row.limit_window_seconds };
-        if (Number.isFinite(row.reset_at) && row.reset_at > 0 && row.reset_at < 8640000000000) window.resetsAt = new Date(row.reset_at * 1000).toISOString();
-        windows.push(window);
-      }
-      if (!windows.length) throw new UsageError("CPA returned no valid Codex quota windows");
-      return windows;
-    },
-  },
-  claude: {
-    request: {
-      method: "GET", url: "https://api.anthropic.com/api/oauth/usage",
-      header: { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": "claude-cli/2.1.280 (external, cli)", Accept: "application/json" },
-    },
-    parse: usageWindows,
-  },
+  claude: { read: readClaudeUsage, passive: claudeSignalWindows },
 };
 
+function managementScope(base, metadata) {
+  return base + "|" + createHash("sha256").update(metadata.managementKey).digest("hex").slice(0, 12);
+}
+
+function liveResets(resets, now) {
+  if (!resets || !Array.isArray(resets.each)) return resets;
+  const each = resets.each.filter(card => !card.until || Date.parse(card.until) > now);
+  if (!each.length) return;
+  const live = { count: each.length, each };
+  if (each[0].until) live.until = each[0].until;
+  return live;
+}
+
+function retryAfter(header, now) {
+  if (header === null || typeof header !== "object") return;
+  for (const [key, values] of Object.entries(header)) {
+    if (key.toLowerCase() !== "retry-after") continue;
+    const value = String(Array.isArray(values) ? values[0] : values).trim();
+    const ms = /^\d{1,9}$/.test(value) ? Number(value) * 1000 : Date.parse(value) - now;
+    return Number.isFinite(ms) && ms > 0 ? ms : undefined;
+  }
+}
+
+// Repeated upstream failures double the 300s pause up to an hour; a longer Retry-After wins up to that cap.
+function upstreamDelay(error, failures) {
+  const backoff = Math.min(readTTL * 2 ** Math.min(failures - 1, 4), 3_600_000);
+  return Math.min(Math.max(backoff, error?.retryAfter ?? 0), 3_600_000);
+}
+
 function createUsage({ request = (...args) => fetch(...args), now = () => Date.now(),
-  timeout = ms => AbortSignal.timeout(ms), adapters = usageAdapters } = {}) {
-  const cache = new Map();
-  const blocked = new Map();
+  timeout = ms => AbortSignal.timeout(ms), adapters = usageAdapters, blocked = new Map() } = {}) {
+  const cache = new Map(); // per Magpie selection: the rendered reading
+  const lists = new Map(); // per management scope: one credential list shared for 15s
+  const upstream = new Map(); // per CPA credential: upstream readings shared by every selection
   const render = entry => entry.value && (!entry.error || now() - entry.updatedAt <= 900_000)
     ? entry.value : { error: entry.error, signIn: "kept" };
   return async getAuth => {
@@ -128,13 +234,13 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
       const base = managementBase(metadata);
       const selection = metadata.credential ?? "";
       if (typeof selection !== "string") throw new UsageError("Check the CPA credential selection");
-      const scope = base + "|" + createHash("sha256").update(metadata.managementKey).digest("hex").slice(0, 12);
+      const scope = managementScope(base, metadata);
       if (blocked.has(scope)) return { error: blocked.get(scope), signIn: "kept" };
       const key = JSON.stringify([scope, selection]);
       let entry = cache.get(key);
       if (!entry) { entry = {}; cache.set(key, entry); }
       if (entry.pending) return await within(entry.pending, signal);
-      if (entry.value && now() - entry.updatedAt < 300_000 || now() < entry.retryAt) return render(entry);
+      if (entry.value && now() - entry.updatedAt < readTTL || now() < entry.retryAt) return render(entry);
       const call = (path, maxBytes, body) => within((async () => {
         signal.throwIfAborted();
         const response = await request(base + path, {
@@ -153,65 +259,108 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
         }
         return readJSON(response, maxBytes);
       })(), signal);
+      // Accounts on one CPA refreshed together share a single credential list.
+      const credentialList = () => {
+        let list = lists.get(scope);
+        if (!list || now() - list.at >= 15_000) {
+          list = { at: now(), files: call("/credentials", 1 << 20).then(credentials => {
+            if (!Array.isArray(credentials?.files)) throw new UsageError("Invalid CPA credential list", { stale: false });
+            return credentials.files;
+          }) };
+          lists.set(scope, list);
+          list.files.catch(() => { if (lists.get(scope) === list) lists.delete(scope); });
+        }
+        return within(list.files, signal);
+      };
+      // Upstream reads are cached per credential, so every selection naming it shares one reading,
+      // one in-flight request and one backoff. CPA's passive signals supply the windows when they
+      // are recent; the reset inventory then needs a fresh read only every 30 minutes.
+      const credentialReading = async (credential, adapter, apiCall) => {
+        const upstreamKey = JSON.stringify([scope, credential.auth_index]);
+        let state = upstream.get(upstreamKey);
+        if (!state) { state = { memo: {}, failures: 0, retryAt: 0 }; upstream.set(upstreamKey, state); }
+        const t = now();
+        const passive = adapter.passive?.(credential, t);
+        const last = state.reading;
+        const age = last ? t - state.readAt : Infinity;
+        const fromPassive = () => ({ windows: passive.windows,
+          resets: age < inventoryTTL ? liveResets(last.resets, t) : undefined });
+        if (age < readTTL) {
+          return passive && passive.observedAt > state.readAt ? fromPassive()
+            : { windows: last.windows, resets: liveResets(last.resets, t) };
+        }
+        if (passive && last && (!last.inventory || age < inventoryTTL)) return fromPassive();
+        if (!state.pending && t < state.retryAt) {
+          if (passive) return fromPassive();
+          throw state.error;
+        }
+        state.pending ??= (async () => {
+          try {
+            const reading = await adapter.read(apiCall, credential, { now: t, memo: state.memo });
+            Object.assign(state, { reading, readAt: now(), failures: 0, retryAt: 0, error: undefined });
+            return reading;
+          } catch (error) {
+            state.failures++;
+            state.error = error instanceof UsageError ? error : new UsageError("CPA upstream usage request failed; retry later");
+            state.retryAt = now() + upstreamDelay(error, state.failures);
+            throw error;
+          } finally { state.pending = undefined; }
+        })();
+        try {
+          const reading = await within(state.pending, signal);
+          return { windows: reading.windows, resets: liveResets(reading.resets, now()) };
+        } catch (error) {
+          if (passive) return fromPassive();
+          throw error;
+        }
+      };
       entry.pending = (async () => {
         try {
-          const credentials = await call("/credentials", 1 << 20);
-          if (!Array.isArray(credentials?.files)) throw new UsageError("Invalid CPA credential list", { stale: false });
-          const rows = credentials.files.filter(row => row?.disabled === false);
+          const files = await credentialList();
+          const rows = files.filter(row => row?.disabled === false);
           const supported = row => Object.hasOwn(adapters, row.provider);
           const matches = selection ? rows.filter(row => row.auth_index === selection || row.name === selection)
             : rows.filter(supported);
           if (!matches.length) throw new UsageError(selection ? "Selected CPA credential is missing or disabled"
             : rows.length ? "Quota is not supported for this provider yet" : "No enabled CPA credential found", { stale: false });
-          const codexPool = !selection && matches.some(row => row.provider === "codex") &&
-            matches.every(row => row.provider === "codex" || row.provider === "claude");
-          if (matches.length !== 1 && !codexPool) throw new UsageError("Multiple CPA credentials; choose a unique name or auth_index", { stale: false });
-          if (codexPool) matches.sort((a, b) => String(a.auth_index).localeCompare(String(b.auth_index)));
-          for (const credential of matches) {
-            if (!supported(credential)) throw new UsageError("Quota is not supported for this provider yet", { stale: false });
-            if (typeof credential.auth_index !== "string" || !credential.auth_index.trim() || credential.auth_index.length > 128) {
-              throw new UsageError("Invalid CPA auth_index; check the selected credential", { stale: false });
-            }
+          if (matches.length !== 1) throw new UsageError("Multiple CPA credentials; choose a unique name or auth_index", { stale: false });
+          const credential = matches[0];
+          if (!supported(credential)) throw new UsageError("Quota is not supported for this provider yet", { stale: false });
+          const adapter = adapters[credential.provider];
+          if (typeof credential.auth_index !== "string" || !credential.auth_index.trim() || credential.auth_index.length > 128) {
+            throw new UsageError("Invalid CPA auth_index; check the selected credential", { stale: false });
           }
-          const windows = [];
-          for (const [index, credential] of matches.entries()) {
-            const adapter = adapters[credential.provider];
+          const apiCall = async template => {
             const payload = await call("/requests/api-call", 256 << 10, {
-              ...adapter.request, auth_index: credential.auth_index,
+              ...template, auth_index: credential.auth_index,
             });
             if (payload?.status_code !== 200) {
-              throw new UsageError(payload?.status_code === 401 ? "CPA upstream credential rejected; refresh it in CPA"
-                : "CPA upstream usage request failed; retry later");
+              const status = payload?.status_code;
+              const error = new UsageError(status === 401 ? "CPA upstream credential rejected; refresh it in CPA"
+                : status === 429 ? "CPA upstream usage request rate-limited; retry later"
+                  : "CPA upstream usage request failed; retry later");
+              error.upstreamStatus = status;
+              error.retryAfter = retryAfter(payload?.header, now());
+              throw error;
             }
             if (typeof payload.body !== "string") throw new UsageError("Invalid CPA usage response");
-            const credentialWindows = adapter.parse(JSON.parse(payload.body));
-            if (credential.provider === "codex" || credential.provider === "claude") {
-              for (const window of credentialWindows) {
-                if (credential.provider === "claude") window.name = window.name.replace("5 hours", "5h").replace("7 days", "7d");
-                window.name = (credential.provider === "codex" ? "Codex" : "Claude") + "/" + window.name;
-              }
-            }
-            if (rows.length > 1) {
-              const label = [credential.label, credential.name].find(value => typeof value === "string" && value.trim());
-              for (const window of credentialWindows) {
-                if (codexPool) window.name += "/#" + (index + 1);
-                else if (credential.provider === "claude" || credential.provider === "codex") window.name += "/" + (label || "selected");
-                else window.name += " (credential " + (label || "selected") + ")";
-                window.aside = true;
-              }
-            }
-            windows.push(...credentialWindows);
-          }
-          const planOrder = window => /^Codex\/plus\//i.test(window.name) ? 0 : /^Codex\/free\//i.test(window.name) ? 2 : 1;
-          windows.sort((a, b) => planOrder(a) - planOrder(b));
+            return JSON.parse(payload.body);
+          };
+          const reading = await credentialReading(credential, adapter, apiCall);
+          // Copies, so labelling never alters the reading other selections share.
+          const label = rows.length > 1 &&
+            ([credential.label, credential.name].find(value => typeof value === "string" && value.trim()) || "selected");
+          const windows = reading.windows.map(window => label
+            ? { ...window, name: window.name + " (credential " + label + ")", aside: true } : { ...window });
           entry.value = { windows, signIn: "kept" };
+          if (reading.resets) entry.value.resets = reading.resets;
           entry.updatedAt = now();
           entry.error = undefined;
         } catch (error) {
           entry.error = error instanceof UsageError ? error.message : signal.aborted
             ? "CPA usage timed out; check management access" : "CPA usage unavailable; check management access";
           if (error instanceof UsageError && (!error.stale || error.permanent)) entry.value = undefined;
-          entry.retryAt = now() + 300_000;
+          entry.retryAt = now() + readTTL;
         } finally { entry.pending = undefined; }
         return render(entry);
       })();
@@ -234,15 +383,23 @@ function reasoningLevels(definition) {
     .filter(Boolean))];
 }
 
-async function modelDefinitions(auth) {
+// Management 401/403 counts toward CPA's per-IP ban (5 failures, 30 minutes), so discovery
+// shares the usage hook's rejection breaker instead of retrying a rejected key on every refresh.
+async function modelDefinitions(auth, blocked = new Map()) {
   const metadata = auth?.metadata;
   if (typeof metadata?.managementKey !== "string" || !metadata.managementKey) return new Map();
   try {
+    const base = managementBase(metadata);
+    const scope = managementScope(base, metadata);
+    if (blocked.has(scope)) return new Map();
     const signal = AbortSignal.timeout(10_000);
-    const response = await fetch(managementBase(metadata) + "/routing/model-definitions/claude", {
+    const response = await fetch(base + "/routing/model-definitions/claude", {
       headers: managementHeaders(metadata), signal, redirect: "error",
     });
     if (!response.ok) {
+      if ([401, 403].includes(response.status)) {
+        blocked.set(scope, "CPA management access rejected; check key and remote access");
+      }
       await response.body?.cancel();
       return new Map();
     }
@@ -272,6 +429,7 @@ function applyReasoning(model, definition, configured) {
 }
 
 export default async function CLIProxyAPIPlugin() {
+  const rejectedManagement = new Map();
   return {
     async config(cfg) {
       cfg.provider ??= {};
@@ -279,13 +437,14 @@ export default async function CLIProxyAPIPlugin() {
     },
     auth: {
       provider: "cpa",
-      usage: createUsage(),
+      usage: createUsage({ blocked: rejectedManagement }),
       methods: [{
         type: "api",
         label: "CLIProxyAPI business API key",
         prompts: [
           { type: "text", key: "baseURL", message: "CPA Base URL", validate: validateURL },
-          { type: "password", key: "businessKey", message: "Business API key", validate: value => typeof value === "string" && value.trim() ? undefined : "Business API key is required" },
+          { type: "password", key: "businessKey", message: "Business API key",
+            validate: value => typeof value === "string" && value.trim() ? undefined : "Business API key is required" },
           { type: "password", key: "managementKey", message: "Management key (optional, for usage)" },
           { type: "text", key: "managementURL", message: "Management URL (optional)",
             validate: value => validateURL(value, true) },
@@ -303,6 +462,7 @@ export default async function CLIProxyAPIPlugin() {
               const value = inputs?.[field]?.trim();
               if (value) metadata[field] = value;
             }
+            // Return the prompted key explicitly; API account labels use metadata.email.
             return { type: "success", key, metadata };
           } catch {
             return { type: "failed", error: "Invalid CPA or management URL" };
@@ -325,33 +485,23 @@ export default async function CLIProxyAPIPlugin() {
       async models(provider, { auth } = {}) {
         if (auth?.type !== "api" || !auth.key) return {};
         const baseURL = normalizeURL(auth.metadata?.baseURL);
-        const definitionsPromise = modelDefinitions(auth);
-        const fetchModels = headers => fetch(baseURL + "/v1/models", {
-          headers, signal: AbortSignal.timeout(10_000), redirect: "error",
+        const definitionsPromise = modelDefinitions(auth, rejectedManagement);
+        const response = await fetch(baseURL + "/v1/models", {
+          headers: { "x-api-key": auth.key, "anthropic-version": "2023-06-01" },
+          signal: AbortSignal.timeout(10_000),
+          redirect: "error",
         });
-        const response = await fetchModels({ "x-api-key": auth.key, "anthropic-version": "2023-06-01" });
         if (!response.ok) {
           await response.body?.cancel();
           const error = new Error("CPA model discovery failed (HTTP " + response.status + ")");
           if ([401, 403].includes(response.status)) error.signIn = "expired";
           throw error;
         }
-        let [payload, definitions] = await Promise.all([
+        const [payload, definitions] = await Promise.all([
           readJSON(response, 1 << 20), definitionsPromise,
         ]);
         if (!Array.isArray(payload?.data)) {
           throw new Error("Invalid CPA model list");
-        }
-        if (payload.data.length && payload.data.every(row => typeof row?.id === "string" && row.id.startsWith("claude-fable-5-dd-"))) {
-          const fallback = await fetchModels({ Authorization: "Bearer " + auth.key });
-          if (!fallback.ok) {
-            await fallback.body?.cancel();
-            const error = new Error("CPA model discovery failed (HTTP " + fallback.status + ")");
-            if ([401, 403].includes(fallback.status)) error.signIn = "expired";
-            throw error;
-          }
-          payload = await readJSON(fallback, 1 << 20);
-          if (!Array.isArray(payload?.data)) throw new Error("Invalid CPA model list");
         }
         const models = {};
         for (const row of payload.data) {
