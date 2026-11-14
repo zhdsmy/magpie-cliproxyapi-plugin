@@ -238,7 +238,7 @@ test("five concurrent calls share exactly one credentials plus api-call pair", a
   assert.equal(h.calls.length, 2);
 });
 
-test("success cache expires at 300s; transient failure preserves at most 900s old readings without error", async () => {
+test("success cache expires at 300s; transient failure preserves at most 900s old readings; repeated failures back off", async () => {
   const h = harness();
   const first = await h.get();
   h.advance(299_999);
@@ -255,9 +255,15 @@ test("success cache expires at 300s; transient failure preserves at most 900s ol
   assert.deepEqual(await h.get(), first);
   h.advance(1);
   assertError(await h.get());
-  h.advance(300_000);
+  // The second upstream failure doubled the pause to 600s: CPA is asked, Anthropic is not.
   h.usage = envelope({ five_hour: window(5), seven_day: window(10) });
+  h.advance(300_000);
+  assertError(await h.get());
+  assert.equal(h.calls.length, 7);
+  assert.ok(h.calls.at(-1).url.endsWith("/credentials"));
+  h.advance(300_000);
   assert.equal((await h.get()).windows[0].used, 5);
+  assert.equal(h.calls.length, 9);
 });
 
 test("inner failure never replaces a cached reading with its plausible body", async () => {
@@ -278,16 +284,22 @@ test("a newly ambiguous credential pool invalidates old routing windows", async 
   assertError(await h.get());
 });
 
-test("cache is isolated by management key, endpoint and credential selection", async () => {
+test("cache is isolated by management key and endpoint; selections naming one credential share it", async () => {
   const h = harness();
   await h.get();
   for (const metadata of [{ managementKey: "test-mgmt-key-other" },
-    { managementURL: "https://management.example.invalid/private" }, { credential: "one" }]) {
+    { managementURL: "https://management.example.invalid/private" }]) {
     await h.get(metadata);
   }
-  assert.equal(h.calls.length, 8);
+  assert.equal(h.calls.length, 6);
+  // "", the name and the auth_index all resolve to index-one: one credential list, one upstream read.
+  for (const credential of ["one", "index-one"]) assert.equal((await h.get({ credential })).windows[0].used, 25);
   await h.get();
-  assert.equal(h.calls.length, 8);
+  assert.equal(h.calls.length, 6);
+  h.advance(15_000);
+  await h.get({ credential: "other-selection-same-scope" });
+  assert.equal(h.calls.length, 7);
+  assert.ok(h.calls.at(-1).url.endsWith("/credentials"));
 });
 
 test("management credentials stay at the explicit management endpoint, never the OAuth target", async () => {
@@ -365,17 +377,21 @@ test("real management redirects are rejected without sending the key to their ta
 
 test("provider adapter dispatches its own request template and parser through the shared cache", async () => {
   let parsed = 0;
+  const template = { method: "GET", url: "https://usage.example.invalid/mock",
+    header: { Authorization: "Bearer $TOKEN$", Accept: "application/json" } };
   const adapter = {
-    request: { method: "GET", url: "https://usage.example.invalid/mock",
-      header: { Authorization: "Bearer $TOKEN$", Accept: "application/json" } },
-    parse(body) { parsed++; assert.deepEqual(body, { percent: 17 });
-      return [{ name: "Mock window", used: body.percent, span: 3600 }]; },
+    async read(apiCall, credential) {
+      assert.equal(credential.auth_index, row.auth_index);
+      const body = await apiCall(template);
+      parsed++; assert.deepEqual(body, { percent: 17 });
+      return { windows: [{ name: "Mock window", used: body.percent, span: 3600 }] };
+    },
   };
   const h = harness({ adapters: { mock: adapter }, files: [{ ...row, provider: "mock" }],
     usage: envelope({ percent: 17 }) });
   const result = await h.get();
   assert.deepEqual(result, { signIn: "kept", windows: [{ name: "Mock window", used: 17, span: 3600 }] });
-  assert.deepEqual(JSON.parse(h.calls[1].init.body), { ...adapter.request, auth_index: row.auth_index });
+  assert.deepEqual(JSON.parse(h.calls[1].init.body), { ...template, auth_index: row.auth_index });
   assert.equal(new Headers(h.calls[1].init.headers).get("authorization"), "Bearer " + managementKey);
   assert.deepEqual(await h.get(), result);
   assert.equal(parsed, 1);
@@ -404,8 +420,10 @@ test("automatic selection uses the sole enabled supported credential; a mixed po
 });
 
 test("several supported providers require an explicit unique selection and share the aside rule", async () => {
-  const adapter = { request: { method: "GET", url: "https://usage.example.invalid/mock", header: {} },
-    parse: () => [{ name: "Mock window", used: 10, span: 3600 }] };
+  const adapter = { read: async apiCall => {
+    await apiCall({ method: "GET", url: "https://usage.example.invalid/mock", header: {} });
+    return { windows: [{ name: "Mock window", used: 10, span: 3600 }] };
+  } };
   const h = harness({ adapters: { mockA: adapter, mockB: adapter },
     files: [{ ...row, provider: "mockA" }, { ...second, provider: "mockB" }] });
   assertError(await h.get());
@@ -426,8 +444,10 @@ test("unsupported selection replaces old quota with an error instead of reusing 
 });
 
 test("new adapters retain the common management rejection circuit breaker", async () => {
-  const h = harness({ adapters: { mock: { request: { method: "GET", url: "https://usage.example.invalid/mock" },
-    parse: () => { throw new Error("must not parse rejected response"); } } }, files: [{ ...row, provider: "mock" }],
+  const h = harness({ adapters: { mock: { read: async apiCall => {
+    await apiCall({ method: "GET", url: "https://usage.example.invalid/mock" });
+    throw new Error("must not parse rejected response");
+  } } }, files: [{ ...row, provider: "mock" }],
     request: (url, _init, h) => url.endsWith("/credentials") ? Response.json({ files: h.files })
       : new Response("private-response-marker", { status: 403 }) });
   for (let i = 0; i < 10; i++) { assertError(await h.get()); h.advance(1_800_000); }

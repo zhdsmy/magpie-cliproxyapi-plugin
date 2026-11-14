@@ -1,7 +1,7 @@
 {
   "name": "magpie-cliproxyapi-plugin",
   "version": "0.0.2",
-  "description": "Magpie provider for CLIProxyAPI models and optional credential quotas",
+  "description": "Magpie provider for Claude via CLIProxyAPI, with optional quota, reset-card and reasoning-level readings",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
@@ -16,7 +16,8 @@
   },
   "keywords": [
     "magpie-plugin",
-    "cliproxyapi"
+    "cliproxyapi",
+    "claude"
   ],
   "license": "MIT",
   "engines": {
