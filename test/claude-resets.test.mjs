@@ -53,13 +53,14 @@ test("Claude reset grants come from the same usage read and use Magpie's resets 
   assert.ok(!JSON.stringify(result).includes("Launch offer"));
 });
 
-test("only one read-only GET is sent; no claim, profile or cooldown request", async () => {
+test("only read-only GETs are sent: usage once, the plan profile once; no claim or cooldown request", async () => {
   const h = harness();
   await h.get();
-  assert.deepEqual(h.inner().map(call => [call.method, call.url]), [["GET", usageURL + "?cedar_ember=1"]]);
-  assert.equal(h.inner()[0].data, undefined);
+  assert.deepEqual(h.inner().map(call => [call.method, call.url]),
+    [["GET", usageURL + "?cedar_ember=1"], ["GET", "https://api.anthropic.com/api/oauth/profile"]]);
+  for (const call of h.inner()) assert.equal(call.data, undefined);
   for (const call of h.calls) {
-    assert.ok(!/reset_rate_limits|oauth\/profile|cooldown/.test(call.url + JSON.stringify(call.body ?? {})));
+    assert.ok(!/reset_rate_limits|cooldown/.test(call.url + JSON.stringify(call.body ?? {})));
   }
 });
 
@@ -88,7 +89,8 @@ test("an upstream 400/403 on the opt-in query falls back once to the plain usage
     const result = await h.get();
     assert.equal(result.windows.length, 2);
     assert.equal(result.resets, undefined);
-    assert.deepEqual(h.inner().map(call => call.url), [usageURL + "?cedar_ember=1", usageURL]);
+    assert.deepEqual(h.inner().map(call => call.url), [usageURL + "?cedar_ember=1", usageURL,
+      "https://api.anthropic.com/api/oauth/profile"]);
   }
   for (const status of [401, 429, 500]) {
     const h = harness({ usage: envelope({}, status) });

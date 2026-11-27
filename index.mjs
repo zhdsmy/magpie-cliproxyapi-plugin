@@ -80,6 +80,7 @@ function usageWindows(data) {
 }
 
 const claudeUsageURL = "https://api.anthropic.com/api/oauth/usage";
+const claudeProfileURL = "https://api.anthropic.com/api/oauth/profile";
 const claudeUsageHeader = { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20",
   "User-Agent": "claude-cli/2.1.280 (external, cli)", Accept: "application/json" };
 const claudeGrantID = /^[a-z0-9_-]{1,40}$/;
@@ -88,6 +89,59 @@ function optionalTime(value) {
   if (value === undefined || value === null) return null;
   const ms = typeof value === "string" ? Date.parse(value) : NaN;
   return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+}
+
+// Plan names follow Claude's current naming (and T3 Code's): the former Max 5x is "Max" and the
+// former Max 20x is "Ultra". Only organization_type and rate_limit_tier are read from the profile;
+// unknown values give no plan rather than passing Anthropic's raw strings on.
+function claudePlan(profile) {
+  const org = profile?.organization;
+  const type = org?.organization_type;
+  if (type === "claude_pro") return "Pro";
+  if (type === "claude_max") return typeof org.rate_limit_tier === "string" && org.rate_limit_tier.includes("20x") ? "Ultra" : "Max";
+  if (type === "claude_team") return "Team";
+  if (type === "claude_enterprise") return "Enterprise";
+}
+
+// Model-scoped weekly limits (e.g. Fable's own week), named and scoped as Magpie's built-in Claude
+// names them: "7 days · Fable" counting models whose id contains "fable"; "Fable 5.1" → "fable-5-1".
+function claudeScopedWindows(data, plan) {
+  const windows = [];
+  const add = (scope, used, resetsAt) => {
+    if (typeof scope !== "string" || !/^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/.test(scope.trim())) return;
+    if (typeof used !== "number" || !Number.isFinite(used) || used < 0) return;
+    const reset = optionalTime(resetsAt);
+    if (reset === undefined) return;
+    const model = scope.trim().toLowerCase().replace(/[ .]/g, "-");
+    if (windows.some(window => window.model === model)) return;
+    const window = { name: "7 days · " + scope.trim(), used, span: 604800, model };
+    if (reset) window.resetsAt = reset;
+    windows.push(window);
+  };
+  const rawLimits = Array.isArray(data?.limits) ? data.limits : [];
+  for (const limit of rawLimits) {
+    if (limit?.kind === "weekly_scoped") add(limit.scope?.model?.display_name, limit.percent, limit.resets_at);
+  }
+  // Fable is granted per account (Pro gets it only now and then). Infer "Not in plan" only when
+  // the profile confirmed Pro, `limits` carries the standard session/weekly entries, and no raw
+  // weekly_scoped limit mentions Fable (so a parse failure never falsely blocks a Fable-capable account).
+  const told = rawLimits.some(limit => ["session", "weekly_all"].includes(limit?.kind));
+  const hasFable = windows.some(window => window.model.includes("fable")) ||
+    rawLimits.some(limit => limit?.kind === "weekly_scoped" &&
+      [limit.scope?.model?.display_name, limit.scope?.model?.id]
+        .some(value => typeof value === "string" && value.toLowerCase().includes("fable")));
+  if (plan === "Pro" && told && !hasFable) {
+    windows.push({ name: "7 days · Fable", used: 100, span: 604800, model: "fable", display: "Not in plan" });
+  }
+  return windows;
+}
+
+// Paid usage past the plan, shown only while it is on; display only, so it never moves routing.
+function claudeCreditsWindow(data) {
+  const extra = data?.extra_usage;
+  const used = extra?.utilization;
+  if (extra?.is_enabled !== true || typeof used !== "number" || !Number.isFinite(used) || used < 0) return;
+  return { name: "Usage credits", used, aside: true };
 }
 
 // Claude usage-limit reset grants ("Reset for free" in Claude Settings > Usage), read from the
@@ -145,10 +199,44 @@ async function readClaudeUsage(apiCall, _credential, { now, memo = {} }) {
       inventory = false;
     }
   }
-  const reading = { windows: usageWindows(data), inventory };
+  const baseWindows = usageWindows(data);
+  await readClaudeProfile(apiCall, now, memo);
+  const extraWindows = claudeScopedWindows(data, memo.plan);
+  const credits = claudeCreditsWindow(data);
+  if (credits) extraWindows.push(credits);
+  const reading = { windows: [...baseWindows, ...extraWindows], extraWindows, inventory };
   const resets = claudeResets(data?.cedar_ember, now);
   if (resets) reading.resets = resets;
+  if (memo.plan) reading.plan = memo.plan;
+  if (memo.until && Date.parse(memo.until) > now) reading.until = memo.until;
   return reading;
+}
+
+const profileTTL = 86_400_000;
+const profileRetry = 1_800_000;
+
+// The plan comes from the account's OAuth profile, read through the same CPA api-call once a day.
+// Its failures never fail the usage reading: a refusal (401/403/404) is not asked again for a day,
+// anything else keeps the last plan and is retried on the next active read after 30 minutes (or a
+// longer Retry-After, up to a day). Only the daily schedule (`profileDueAt`) wakes a passive-only
+// credential, so a persistently failing profile never triggers extra usage reads every 30 minutes.
+// Names, emails and ids in the profile are never kept.
+async function readClaudeProfile(apiCall, now, memo) {
+  if (memo.profileAt > now) return;
+  try {
+    const profile = await apiCall({ method: "GET", url: claudeProfileURL, header: claudeUsageHeader }, 3_000);
+    memo.plan = claudePlan(profile);
+    const trial = optionalTime(profile?.organization?.claude_code_trial_ends_at);
+    memo.until = trial && Date.parse(trial) > now ? trial : undefined;
+    memo.profileAt = now + profileTTL;
+    memo.profileDueAt = memo.profileAt;
+  } catch (error) {
+    if (error?.permanent) throw error;
+    const refused = [401, 403, 404].includes(error?.upstreamStatus);
+    const retry = Math.min(Math.max(profileRetry, error?.retryAfter ?? 0), profileTTL);
+    memo.profileAt = now + (refused ? profileTTL : retry);
+    memo.profileDueAt = now + profileTTL;
+  }
 }
 
 const readTTL = 300_000;
@@ -299,6 +387,25 @@ function managementScope(base, metadata) {
   return base + "|" + createHash("sha256").update(metadata.managementKey).digest("hex").slice(0, 12);
 }
 
+function liveUntil(until, now) {
+  return until && Date.parse(until) > now ? until : undefined;
+}
+
+// Several credentials on one CPA share one Magpie account, so their plans are told together:
+// "<plan> x N" when every credential in the pool shares the same provider and plan (ChatGPT plans
+// prefixed so they never read as Claude's Pro), "Mixed (N)" when plans or providers differ or some
+// credentials have no known plan, and nothing when none has a known plan.
+function poolPlan(entries) {
+  const known = entries.filter(({ plan }) => typeof plan === "string" && plan);
+  if (!known.length) return;
+  const [{ provider, plan }] = known;
+  if (known.length === entries.length && known.every(entry => entry.provider === provider && entry.plan === plan)) {
+    const name = provider === "codex" ? "ChatGPT " + plan[0].toUpperCase() + plan.slice(1) : plan;
+    return name + " x " + entries.length;
+  }
+  return "Mixed (" + entries.length + ")";
+}
+
 function liveResets(resets, now) {
   if (!resets || !Array.isArray(resets.each)) return resets;
   const each = resets.each.filter(card => !card.until || Date.parse(card.until) > now);
@@ -416,14 +523,22 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
         const last = state.reading;
         const age = last ? t - state.readAt : Infinity;
         const inventoryAge = last ? t - (last.inventoryAt ?? state.readAt) : Infinity;
-        const fromPassive = () => ({ windows: passive.windows,
-          plan: passive.plan ?? last?.plan,
+        // Passive signals carry only the 5-hour and 7-day pair, so the last read's other windows
+        // (a model's own week, usage credits) stay beside them until the next read, dropping any
+        // whose reset time has already passed.
+        const liveExtra = () => (last?.extraWindows ?? []).filter(window => !window.resetsAt || Date.parse(window.resetsAt) > t);
+        const fromPassive = () => ({ windows: [...passive.windows, ...liveExtra()],
+          plan: passive.plan ?? last?.plan, until: liveUntil(last?.until, t),
           resets: inventoryAge < inventoryTTL ? liveResets(last?.resets, t) : undefined });
         if (age < readTTL) {
           return passive && passive.observedAt > state.readAt ? fromPassive()
-            : { windows: last.windows, plan: last.plan, resets: liveResets(last.resets, t) };
+            : { windows: last.windows, plan: last.plan, until: liveUntil(last.until, t), resets: liveResets(last.resets, t) };
         }
-        if (passive && (passive.inventory === false || last && (!last.inventory || inventoryAge < inventoryTTL))) return fromPassive();
+        // Even in plain mode (cedar_ember refused), re-read every 30 minutes while extra windows
+        // (such as Fable's week or "Not in plan") are present, and once a day when the profile is due.
+        const profileDue = credential.provider === "claude" && state.memo.profileDueAt <= t;
+        const staleSide = (last?.inventory || last?.extraWindows?.length) && inventoryAge >= inventoryTTL;
+        if (passive && (passive.inventory === false || last && !staleSide && !profileDue)) return fromPassive();
         if (!state.pending && t < state.retryAt) {
           if (passive) return fromPassive();
           throw state.error;
@@ -445,7 +560,8 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
         })();
         try {
           const reading = await within(state.pending, signal);
-          return { windows: reading.windows, plan: reading.plan, resets: liveResets(reading.resets, now()) };
+          return { windows: reading.windows, plan: reading.plan, until: liveUntil(reading.until, now()),
+            resets: liveResets(reading.resets, now()) };
         } catch (error) {
           if (error?.permanent) throw error;
           if (passive) return fromPassive();
@@ -528,15 +644,27 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
             const label = credentialLabel(matches[index]);
             if (error) return [{ name: label, display: "Quota unavailable; check credential in CPA", aside: true }];
             const models = exclusive?.get(matches[index].auth_index);
-            return reading.windows.map(window => rows.length > 1
-              ? { ...window, name: window.name + " (" + label + ")",
-                ...(models?.length ? { models } : { aside: true }) } : { ...window });
+            return reading.windows.map(window => {
+              if (rows.length <= 1) return { ...window };
+              const named = { ...window, name: window.name + " (" + label + ")" };
+              if (window.aside) return named;
+              // A model's own week counts only its models among the credential's exclusive ones.
+              const counted = window.model ? models?.filter(id => id.includes(window.model)) : models;
+              return { ...named, ...(counted?.length ? { models: counted } : { aside: true }) };
+            });
           });
           entry.value = { windows, signIn: "kept" };
           if (matches.length === 1) {
             const reading = successes[0].reading;
             if (reading.resets) entry.value.resets = reading.resets;
             if (reading.plan) entry.value.plan = reading.plan;
+            if (reading.until) entry.value.until = reading.until;
+          } else {
+            const plan = poolPlan(readings.map(({ reading }, index) => {
+              const cached = upstream.get(JSON.stringify([scope, matches[index].auth_index]));
+              return { provider: matches[index].provider, plan: reading?.plan ?? cached?.reading?.plan ?? cached?.memo?.plan };
+            }));
+            if (plan) entry.value.plan = plan;
           }
           entry.updatedAt = now();
           entry.error = undefined;

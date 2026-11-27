@@ -4,7 +4,8 @@ import { once } from "node:events";
 export async function createMockCPA(port = 0, options = {}) {
   const state = { mode: "normal", managementMode: "normal", requests: [], cancellations: 0,
     models: options.models ?? ["claude-sonnet-4-6"], files: options.files, credentialModels: options.credentialModels,
-    used: options.used ?? 25, weekUsed: options.weekUsed ?? 50 };
+    used: options.used ?? 25, weekUsed: options.weekUsed ?? 50,
+    profiles: options.profiles, usages: options.usages, limits: options.limits, extraUsage: options.extraUsage };
   const server = createServer(async (request, response) => {
     const json = (status, body) => {
       response.writeHead(status, { "content-type": "application/json" });
@@ -26,6 +27,10 @@ export async function createMockCPA(port = 0, options = {}) {
       if (body.credentialModels) state.credentialModels = body.credentialModels;
       if (Number.isFinite(body.used)) state.used = body.used;
       if (Number.isFinite(body.weekUsed)) state.weekUsed = body.weekUsed;
+      if ("profiles" in body) state.profiles = body.profiles;
+      if ("usages" in body) state.usages = body.usages;
+      if ("limits" in body) state.limits = body.limits;
+      if ("extraUsage" in body) state.extraUsage = body.extraUsage;
       return json(200, { mode: state.mode, managementMode: state.managementMode });
     }
     state.requests.push({ mode: state.mode, at: Date.now(), path: request.url, method: request.method, headers: request.headers, model: body.model, body });
@@ -68,13 +73,31 @@ export async function createMockCPA(port = 0, options = {}) {
         }
         const expected = { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20",
           "User-Agent": "claude-cli/2.1.280 (external, cli)", Accept: "application/json" };
-        if (request.method !== "POST" || !["index-one", "index-two"].includes(body.auth_index) || body.method !== "GET" ||
-            body.url !== "https://api.anthropic.com/api/oauth/usage?cedar_ember=1" ||
+        const knownIndexes = state.files ? state.files.map(file => file.auth_index) : ["index-one", "index-two"];
+        const isUsage = body.url === "https://api.anthropic.com/api/oauth/usage?cedar_ember=1" ||
+          body.url === "https://api.anthropic.com/api/oauth/usage";
+        const isProfile = body.url === "https://api.anthropic.com/api/oauth/profile";
+        if (request.method !== "POST" || !knownIndexes.includes(body.auth_index) || body.method !== "GET" ||
+            (!isUsage && !isProfile) ||
             Object.keys(body.header ?? {}).length !== 4 || Object.entries(expected).some(([k, v]) => body.header?.[k] !== v)) {
           return json(400, { error: "invalid test api-call template" });
         }
-        const usage = { five_hour: { utilization: state.used, resets_at: new Date(Date.now() + 3600_000).toISOString() },
-          seven_day: { utilization: state.weekUsed, resets_at: new Date(Date.now() + 86400_000).toISOString() } };
+        if (isProfile) {
+          const entry = state.profiles?.[body.auth_index] ?? state.profiles?.["*"];
+          if (!entry) return json(200, { status_code: 404, body: "{}" });
+          if (typeof entry.status_code === "number") {
+            return json(200, { status_code: entry.status_code,
+              body: typeof entry.body === "string" ? entry.body : JSON.stringify(entry.body ?? {}) });
+          }
+          return json(200, { status_code: 200, body: JSON.stringify(entry) });
+        }
+        const customUsage = state.usages?.[body.auth_index] ?? state.usages?.["*"];
+        const usage = customUsage ?? {
+          five_hour: { utilization: state.used, resets_at: new Date(Date.now() + 3600_000).toISOString() },
+          seven_day: { utilization: state.weekUsed, resets_at: new Date(Date.now() + 86400_000).toISOString() },
+          ...(state.limits !== undefined ? { limits: state.limits } : {}),
+          ...(state.extraUsage !== undefined ? { extra_usage: state.extraUsage } : {}),
+        };
         return json(200, { status_code: state.managementMode === "inner401" ? 401 : 200, body: JSON.stringify(usage) });
       }
       return json(404, { error: "test management route not found" });

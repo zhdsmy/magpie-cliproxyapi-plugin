@@ -122,7 +122,9 @@ test("pure Claude, pure Codex and mixed pools display all supported credentials 
     assert.deepEqual(first, reordered);
     assert.equal(first.windows.length, files.length * 2);
     assert.ok(first.windows.every(w => w.aside === true));
-    assert.equal(first.plan, undefined);
+    // Pure Codex pool reports "<plan> x N"; mixed providers report "Mixed (N)"; all-unknown Claude omits plan.
+    assert.equal(first.plan, files.every(f => f.provider === "codex") ? "ChatGPT Plus x 2"
+      : files.some(f => f.provider === "codex") ? "Mixed (" + files.length + ")" : undefined);
     assert.equal(first.resets, undefined);
     assert.ok(!JSON.stringify(first).includes("@"));
     assert.ok(first.windows[0].name.startsWith("5 hours ("));
@@ -257,7 +259,7 @@ test("an explicit Claude selection in a multi-credential CPA keeps resets while 
     const result = await h.get(codex.auth_index);
     assert.equal(result.plan, "plus");
     assert.ok(result.windows.every(window => window.aside === true));
-    assert.equal((await h.get()).plan, undefined);
+    assert.equal((await h.get()).plan, "Mixed (2)");
   }
 });
 

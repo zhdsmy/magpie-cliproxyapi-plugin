@@ -8,6 +8,7 @@ const managementKey = "test-mgmt-key-LEAKCHECK";
 const businessKey = "test-biz-key-usage";
 const baseURL = "https://cpa.example.invalid";
 const reset = "2026-11-04T00:00:00Z";
+const profileURL = "https://api.anthropic.com/api/oauth/profile";
 const row = { provider: "claude", disabled: false, auth_index: "index-one", name: "one", label: "First" };
 const second = { ...row, auth_index: "index-two", name: "two", label: "Second" };
 const window = (utilization = 25, resets_at = reset) => ({ utilization, resets_at });
@@ -19,9 +20,14 @@ const account = (metadata = {}) => ({ type: "api", key: businessKey,
 function harness({ files = [row], usage = envelope(), request, timeout, adapters } = {}) {
   let clock = 1_000_000;
   const calls = [];
-  const h = { files, usage, calls, advance: ms => { clock += ms; } };
+  const h = { files, usage, calls, profiles: [], profile: { status_code: 404, body: "" }, advance: ms => { clock += ms; } };
   h.read = _internal.createUsage({ now: () => clock, ...(timeout ? { timeout } : {}), ...(adapters ? { adapters } : {}),
     request: async (url, init) => {
+      // Plan profile reads are covered in claude-plan.test.mjs; here they stay out of the counts.
+      if (String(init.body ?? "").includes(profileURL)) {
+        h.profiles.push({ url, init });
+        return Response.json(h.profile);
+      }
       calls.push({ url, init });
       if (request) return request(url, init, h);
       return Response.json(url.endsWith("/credentials") ? { files: h.files } : h.usage);

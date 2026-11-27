@@ -5,6 +5,7 @@ import { _internal } from "../index.mjs";
 const managementKey = "test-mgmt-key-LEAKCHECK";
 const baseURL = "https://cpa.example.invalid";
 const usageURL = "https://api.anthropic.com/api/oauth/usage";
+const profileURL = "https://api.anthropic.com/api/oauth/profile";
 const start = Date.parse("2026-11-03T20:00:00Z");
 const row = { provider: "claude", disabled: false, auth_index: "index-one", name: "one", label: "First" };
 const windows = (five = 25, week = 50) => ({
@@ -32,10 +33,12 @@ const signalWindows = [
 function harness({ usage = envelope({ ...windows(), cedar_ember: cedar() }), files } = {}) {
   let clock = start;
   const calls = [];
-  const h = { usage, plain: envelope(windows()), files: files ?? [row], calls, advance: ms => { clock += ms; },
+  const h = { usage, plain: envelope(windows()), files: files ?? [row], calls, profiles: [], profile: envelope({}, 404), advance: ms => { clock += ms; },
     now: () => clock };
   h.read = _internal.createUsage({ now: () => clock, request: async (url, init) => {
     const body = init.body ? JSON.parse(init.body) : undefined;
+    // Plan profile reads are covered in claude-plan.test.mjs; here they stay out of the counts.
+    if (body?.url === profileURL) { h.profiles.push(body); return Response.json(h.profile); }
     calls.push({ url, body });
     if (url.endsWith("/credentials")) return Response.json({ files: typeof h.files === "function" ? h.files() : h.files });
     if (h.gate) await h.gate;
