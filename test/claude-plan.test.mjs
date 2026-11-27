@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { _internal } from "../index.mjs";
+import plugin, { _internal } from "../index.mjs";
 
 const managementKey = "test-mgmt-key-LEAKCHECK";
 const baseURL = "https://cpa.example.invalid";
@@ -170,11 +170,16 @@ test("Fable's own week is model-scoped; 'Not in plan' is inferred only on confir
   }).get();
   assert.deepEqual(versioned.windows.slice(2).map(w => [w.name, w.model, w.used]), [["7 days · Fable 5.1", "fable-5-1", 9]]);
 
-  // Confirmed Pro with session/weekly_all limits and no Fable entry gets "Not in plan".
+  // Confirmed Pro with session/weekly_all limits and no Fable entry gets a text-only aside window
+  // (no used/span/model so Magpie marks it Text: true and excludes it from summary aggregation).
   const proWithout = await harness({ usages: { "*": envelope(usage(limits(["Sonnet", 3]))) }, profiles: pro }).get();
   assert.deepEqual(proWithout.windows.slice(2), [
     { name: "7 days · Sonnet", used: 3, span: 604800, model: "sonnet", resetsAt: "2026-11-10T00:00:00.000Z" },
-    { name: "7 days · Fable", used: 100, span: 604800, model: "fable", display: "Not in plan" }]);
+    { name: "7 days · Fable", display: "Not in plan", aside: true }]);
+  const notInPlan = proWithout.windows.at(-1);
+  assert.equal(Object.hasOwn(notInPlan, "used"), false);
+  assert.equal(Object.hasOwn(notInPlan, "span"), false);
+  assert.equal(Object.hasOwn(notInPlan, "model"), false);
 
   // Non-Pro plans and unknown profiles NEVER infer "Not in plan".
   for (const prof of [max, { "*": envelope(profile("claude_team", "x")) }, { "*": envelope(profile("claude_enterprise", "x")) }, { "*": envelope({}, 403) }]) {
@@ -215,26 +220,28 @@ test("in a pool a model's own window counts only exclusive matching models when 
   const profiles = { a: envelope(profile("claude_max", "default_claude_max_5x")), b: envelope(profile("claude_pro", "default_claude_ai")) };
 
   const aside = await harness({ files, usages, profiles }).get();
-  assert.deepEqual(aside.windows.filter(w => w.model === "fable").map(w => [w.name, w.used, w.aside]), [
-    ["7 days · Fable (Claude La)", 2, true],
-    ["7 days · Fable (Claude Lb)", 100, true],
+  assert.deepEqual(aside.windows.filter(w => w.name.startsWith("7 days · Fable")), [
+    { name: "7 days · Fable (Claude La)", used: 2, span: 604800, model: "fable", resetsAt: "2026-11-10T00:00:00.000Z", aside: true },
+    { name: "7 days · Fable (Claude Lb)", display: "Not in plan", aside: true },
   ]);
 
-  // With modelRouting enabled, La's Fable window gets only La's exclusive Fable model, while Usage credits stays aside.
+  // With modelRouting enabled, La's Fable window gets only La's exclusive Fable model, while
+  // Lb's text-only "Not in plan" window stays aside without models/used/span/model even if Lb lists a Fable ID.
   const usagesCredits = {
     a: envelope(usage({ ...limits(["Fable", 2]), extra_usage: { is_enabled: true, utilization: 10 } })),
     b: envelope(usage(limits())),
   };
   const routed = await harness({
     files, usages: usagesCredits, profiles,
-    credentialModels: { a: ["claude-fable-5", "claude-sonnet-4-6"], b: ["claude-sonnet-4-6", "claude-haiku-5-5"] },
+    credentialModels: { a: ["claude-fable-5", "claude-sonnet-4-6"], b: ["claude-fable-5-1", "claude-sonnet-4-6", "claude-haiku-5-5"] },
   }).get("", { modelRouting: "enabled" });
   const fableA = routed.windows.find(w => w.name === "7 days · Fable (Claude La)");
   assert.deepEqual(fableA.models, ["claude-fable-5"]);
   assert.equal(fableA.aside, undefined);
   const fableB = routed.windows.find(w => w.name === "7 days · Fable (Claude Lb)");
-  assert.equal(fableB.aside, true);
-  assert.equal(fableB.models, undefined);
+  assert.deepEqual(fableB, { name: "7 days · Fable (Claude Lb)", display: "Not in plan", aside: true });
+  assert.equal(Object.hasOwn(fableB, "models"), false);
+  assert.equal(Object.hasOwn(fableB, "used"), false);
   const creditsA = routed.windows.find(w => w.name === "Usage credits (Claude La)");
   assert.equal(creditsA.aside, true);
   assert.equal(creditsA.models, undefined);
@@ -399,4 +406,312 @@ test("profile 429 honours Retry-After (capped at a day); transient profile failu
   h.advance(1_800_000);
   assert.equal((await h.get()).plan, "Pro");
   assert.equal(h.profileReads(), 5);
+});
+
+test("passive signals preserve the text-only 'Not in plan' window and refresh every 30 minutes even in plain mode", async () => {
+  const freshSignals = at => ({ observed_at: new Date(at).toISOString(), signals: {
+    "Anthropic-Ratelimit-Unified-5h-Utilization": "0.42",
+    "Anthropic-Ratelimit-Unified-5h-Reset": String((at + 5 * 3_600_000) / 1000),
+    "Anthropic-Ratelimit-Unified-7d-Utilization": "0.17",
+    "Anthropic-Ratelimit-Unified-7d-Reset": String((at + 7 * 86_400_000) / 1000),
+  } });
+  const auth = { type: "api", key: "test-biz-key", metadata: { baseURL, managementKey } };
+  const h = harness({
+    files: () => [{ ...row("one"), quota: freshSignals(h.now()) }],
+    usages: { "*": envelope({}, 403) }, // plain mode
+    plainUsages: { "*": envelope(usage(limits())) },
+    profiles: { "*": envelope(profile("claude_pro", "default_claude_ai")) },
+  });
+  const first = await h.get();
+  assert.equal(first.plan, "Pro");
+  assert.deepEqual(first.windows.at(-1), { name: "7 days · Fable", display: "Not in plan", aside: true });
+  assert.equal(await h.read.fableExcluded(auth), true);
+  const readsAfterFirst = h.usageReads();
+
+  // At 10 min (< 30m): passive signals keep the text-only window and confirmed exclusion without active reads.
+  h.advance(10 * 60_000);
+  const mid = await h.get();
+  assert.equal(h.usageReads(), readsAfterFirst);
+  assert.deepEqual(mid.windows, [
+    { name: "5 hours", used: 42, span: 18000, resetsAt: new Date(h.now() + 5 * 3_600_000).toISOString() },
+    { name: "7 days", used: 17, span: 604800, resetsAt: new Date(h.now() + 7 * 86_400_000).toISOString() },
+    { name: "7 days · Fable", display: "Not in plan", aside: true },
+  ]);
+  assert.equal(await h.read.fableExcluded(auth), true);
+
+  // At 30 min: active plain refresh runs; a transient 429 falls back to passive display but fails open on exclusion.
+  h.plainUsages = { "*": envelope({}, 429) };
+  h.advance(20 * 60_000);
+  const failedRefresh = await h.get();
+  assert.equal(h.usageReads(), readsAfterFirst + 1);
+  assert.deepEqual(failedRefresh.windows.at(-1), { name: "7 days · Fable", display: "Not in plan", aside: true });
+  assert.equal(await h.read.fableExcluded(auth), false, "read failure must fail open on Fable exclusion");
+
+  // Once backoff ends and account gains Fable, text-only window becomes a real percentage window and exclusion lifts.
+  const nextReset = new Date(h.now() + 7 * 86_400_000).toISOString();
+  h.plainUsages = { "*": envelope(usage(limits(["Fable", 12, nextReset]))) };
+  h.advance(300_000);
+  const gained = await h.get();
+  assert.deepEqual(gained.windows.at(-1), {
+    name: "7 days · Fable", used: 12, span: 604800, model: "fable", resetsAt: nextReset,
+  });
+  assert.equal(await h.read.fableExcluded(auth), false);
+});
+
+function mockDiscoveryFetch(t, {
+  modelIDs = ["claude-sonnet-4-6", "claude-fable-5", "claude-fable-5-20261101[1m]", "claude-fable-5-dd-cloaked"],
+  files = [row("one")],
+  usages = { "*": envelope(usage(limits())) },
+  profiles = { "*": envelope(profile("claude_pro", "default_claude_ai")) },
+  onFetch,
+} = {}) {
+  const calls = [];
+  const pick = (table, index, fallback) => typeof table === "function" ? table(index)
+    : table?.[index] ?? table?.["*"] ?? fallback;
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    const url = String(input);
+    const body = init?.body ? JSON.parse(init.body) : undefined;
+    calls.push({ url, init, body });
+    if (onFetch) {
+      const override = await onFetch(url, init, body, calls);
+      if (override !== undefined) return override;
+    }
+    if (url.endsWith("/v1/models")) {
+      const anthropic = new Headers(init?.headers).has("anthropic-version");
+      return Response.json({ data: modelIDs.map(id => ({ id, ...(anthropic ? { display_name: "Name " + id } : {}) })) });
+    }
+    if (url.includes("/routing/model-definitions/")) return Response.json({ models: [] });
+    if (url.endsWith("/credentials")) return Response.json({ files: typeof files === "function" ? files() : files });
+    if (url.endsWith("/requests/api-call")) {
+      if (body.url === profileURL) return Response.json(pick(profiles, body.auth_index, envelope({}, 404)));
+      return Response.json(pick(usages, body.auth_index, envelope(usage())));
+    }
+    throw new Error("Unexpected fetch: " + url);
+  });
+  return { calls };
+}
+
+test("provider.models removes Fable models only for confirmed Pro without Fable and shares cache/single-flight with auth.usage", async t => {
+  const auth = (extra = {}) => ({ type: "api", key: "test-biz-key",
+    metadata: { baseURL, managementKey, ...extra } });
+
+  // 1) Confirmed Pro without Fable omits all Fable models; subsequent auth.usage hits warm cache with 0 extra calls.
+  {
+    const { calls } = mockDiscoveryFetch(t, {
+      files: [row("pro"), { ...row("disabled-max"), disabled: true }],
+    });
+    const instance = await plugin();
+    const models = await instance.provider.models({}, { auth: auth() });
+    assert.deepEqual(Object.keys(models), ["claude-sonnet-4-6"]);
+    const mgmtAfterModels = calls.filter(c => c.url.includes("/v8/management/")).length;
+    const quota = await instance.auth.usage(() => auth());
+    assert.equal(calls.filter(c => c.url.includes("/v8/management/")).length, mgmtAfterModels, "auth.usage must reuse cache warmed by models()");
+    assert.equal(quota.plan, "Pro");
+    const notInPlan = quota.windows.find(w => w.name === "7 days · Fable");
+    assert.deepEqual(notInPlan, { name: "7 days · Fable", display: "Not in plan", aside: true });
+    assert.equal(Object.hasOwn(notInPlan, "used"), false);
+  }
+
+  // 2) Warm usage cache (auth.usage first -> provider.models second) removes Fable with 0 extra management calls.
+  {
+    const { calls } = mockDiscoveryFetch(t, { files: [row("pro")] });
+    const instance = await plugin();
+    const quota = await instance.auth.usage(() => auth());
+    assert.equal(quota.plan, "Pro");
+    const usageCalls = calls.filter(c => c.url.endsWith("/credentials") || c.url.endsWith("/requests/api-call")).length;
+    const models = await instance.provider.models({}, { auth: auth() });
+    assert.deepEqual(Object.keys(models), ["claude-sonnet-4-6"]);
+    assert.equal(calls.filter(c => c.url.endsWith("/credentials") || c.url.endsWith("/requests/api-call")).length, usageCalls,
+      "models() must reuse warm usage cache without extra management calls");
+  }
+
+  // 3) Explicit credential matching the sole enabled Pro credential also removes Fable.
+  {
+    mockDiscoveryFetch(t, { files: [row("pro")] });
+    const instance = await plugin();
+    const models = await instance.provider.models({}, { auth: auth({ credential: "pro" }) });
+    assert.deepEqual(Object.keys(models), ["claude-sonnet-4-6"]);
+  }
+
+  // 3) Pool where EVERY enabled credential is confirmed Pro without Fable omits Fable.
+  {
+    mockDiscoveryFetch(t, { files: [row("pro-a"), row("pro-b")] });
+    const instance = await plugin();
+    const models = await instance.provider.models({}, { auth: auth() });
+    assert.deepEqual(Object.keys(models), ["claude-sonnet-4-6"]);
+  }
+
+  // 4) Max (5x / Ultra 20x) and Pro WITH Fable keep all Fable models.
+  for (const [label, usages, profiles] of [
+    ["Max without Fable limit", { "*": envelope(usage(limits())) }, { "*": envelope(profile("claude_max", "default_claude_max_5x")) }],
+    ["Max with Fable limit", { "*": envelope(usage(limits(["Fable", 3]))) }, { "*": envelope(profile("claude_max", "default_claude_max_5x")) }],
+    ["Ultra 20x", { "*": envelope(usage(limits(["Fable", 1]))) }, { "*": envelope(profile("claude_max", "default_claude_max_20x")) }],
+    ["Pro with Fable limit", { "*": envelope(usage(limits(["Fable", 5]))) }, { "*": envelope(profile("claude_pro", "default_claude_ai")) }],
+  ]) {
+    mockDiscoveryFetch(t, { usages, profiles });
+    const instance = await plugin();
+    const models = await instance.provider.models({}, { auth: auth() });
+    assert.deepEqual(Object.keys(models), ["claude-sonnet-4-6", "claude-fable-5", "claude-fable-5-20261101[1m]"], label);
+  }
+
+  // 5) Concurrent provider.models and auth.usage share a single in-flight read.
+  {
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const { calls } = mockDiscoveryFetch(t, {
+      onFetch: async (url, _init, body) => {
+        if (url.endsWith("/requests/api-call") && body.url.includes("/oauth/usage")) await gate;
+      },
+    });
+    const instance = await plugin();
+    const modelsPromise = instance.provider.models({}, { auth: auth() });
+    const usagePromise = instance.auth.usage(() => auth());
+    await new Promise(resolve => setTimeout(resolve, 20));
+    release();
+    const [models, quota] = await Promise.all([modelsPromise, usagePromise]);
+    assert.deepEqual(Object.keys(models), ["claude-sonnet-4-6"]);
+    assert.equal(quota.plan, "Pro");
+    assert.equal(calls.filter(c => c.url.endsWith("/credentials")).length, 1);
+    assert.equal(calls.filter(c => c.url.endsWith("/requests/api-call")).length, 2, "one usage + one profile shared");
+  }
+
+  // 6) No Fable model in /v1/models skips usage/profile reads entirely.
+  {
+    const { calls } = mockDiscoveryFetch(t, { modelIDs: ["claude-sonnet-4-6", "claude-fable-5-dd-cloaked"] });
+    const instance = await plugin();
+    const models = await instance.provider.models({}, { auth: auth() });
+    assert.deepEqual(Object.keys(models), ["claude-sonnet-4-6"]);
+    assert.equal(calls.filter(c => c.url.endsWith("/credentials") || c.url.endsWith("/requests/api-call")).length, 0);
+  }
+});
+
+test("provider.models fails open (keeps Fable models) on every unconfirmed, mixed, error or timeout case", async t => {
+  const allExpected = ["claude-sonnet-4-6", "claude-fable-5", "claude-fable-5-20261101[1m]"];
+  const auth = (extra = {}) => ({ type: "api", key: "test-biz-key",
+    metadata: { baseURL, managementKey, ...extra } });
+
+  // 1) Missing managementKey keeps Fable and sends zero management requests.
+  {
+    const { calls } = mockDiscoveryFetch(t);
+    const instance = await plugin();
+    const models = await instance.provider.models({}, { auth: { type: "api", key: "test-biz-key", metadata: { baseURL } } });
+    assert.deepEqual(Object.keys(models), allExpected);
+    assert.equal(calls.filter(c => c.url.includes("/v8/management/")).length, 0);
+  }
+
+  // 2) Unknown plan / profile refused / missing limits / malformed Fable entry on Pro -> fail-open.
+  const unconfirmedCases = [
+    ["profile 403", { "*": envelope(usage(limits())) }, { "*": envelope({}, 403) }],
+    ["profile 429", { "*": envelope(usage(limits())) }, { "*": envelope({}, 429) }],
+    ["unknown org type", { "*": envelope(usage(limits())) }, { "*": envelope(profile("claude_free", "x")) }],
+    ["missing limits", { "*": envelope(usage()) }, { "*": envelope(profile("claude_pro", "default_claude_ai")) }],
+    ["empty limits", { "*": envelope(usage({ limits: [] })) }, { "*": envelope(profile("claude_pro", "default_claude_ai")) }],
+    ["malformed Fable limit", { "*": envelope(usage(limits(["Fable", null]))) }, { "*": envelope(profile("claude_pro", "default_claude_ai")) }],
+    ["Fable by model.id only", { "*": envelope(usage(limits(["Other", 5, "2026-11-10T00:00:00Z", "claude-fable-5"]))) }, { "*": envelope(profile("claude_pro", "default_claude_ai")) }],
+    ["upstream usage 500", { "*": envelope({}, 500) }, { "*": envelope(profile("claude_pro", "default_claude_ai")) }],
+  ];
+  for (const [label, usages, profiles] of unconfirmedCases) {
+    mockDiscoveryFetch(t, { usages, profiles });
+    const instance = await plugin();
+    const models = await instance.provider.models({}, { auth: auth() });
+    assert.deepEqual(Object.keys(models), allExpected, label);
+  }
+
+  // 3) Mixed credentials, partial failure, unsupported sibling, and explicit selection in a multi-credential CPA -> fail-open.
+  const mixedCases = [
+    ["pool Pro + Max", [row("pro"), row("max")], "",
+      { pro: envelope(usage(limits())), max: envelope(usage(limits(["Fable", 2]))) },
+      { pro: envelope(profile("claude_pro", "default_claude_ai")), max: envelope(profile("claude_max", "default_claude_max_5x")) }],
+    ["pool Pro + Codex", [row("pro"), { provider: "codex", disabled: false, auth_index: "cx", name: "cx" }], "",
+      { pro: envelope(usage(limits())), cx: envelope({ plan_type: "plus", rate_limit: { primary_window: { used_percent: 10, limit_window_seconds: 18000, reset_at: start / 1000 + 3600 } } }) },
+      { pro: envelope(profile("claude_pro", "default_claude_ai")) }],
+    ["pool Pro + unsupported", [row("pro"), { provider: "gemini", disabled: false, auth_index: "gm", name: "gm" }], "",
+      { pro: envelope(usage(limits())) }, { pro: envelope(profile("claude_pro", "default_claude_ai")) }],
+    ["pool Pro + failing Pro", [row("pro1"), row("pro2")], "",
+      { pro1: envelope(usage(limits())), pro2: envelope({}, 500) },
+      { "*": envelope(profile("claude_pro", "default_claude_ai")) }],
+    ["explicit Pro inside mixed pool", [row("pro"), row("max")], "pro",
+      { pro: envelope(usage(limits())), max: envelope(usage(limits(["Fable", 2]))) },
+      { pro: envelope(profile("claude_pro", "default_claude_ai")), max: envelope(profile("claude_max", "default_claude_max_5x")) }],
+  ];
+  for (const [label, files, credential, usages, profiles] of mixedCases) {
+    mockDiscoveryFetch(t, { files, usages, profiles });
+    const instance = await plugin();
+    const models = await instance.provider.models({}, { auth: auth(credential ? { credential } : {}) });
+    assert.deepEqual(Object.keys(models), allExpected, label);
+  }
+
+  // 4) Management 401/403 during discovery fails open on Fable and trips the shared breaker.
+  {
+    const { calls } = mockDiscoveryFetch(t, {
+      onFetch: async url => {
+        if (url.includes("/v8/management/")) return new Response("denied", { status: 401 });
+      },
+    });
+    const instance = await plugin();
+    const models = await instance.provider.models({}, { auth: auth() });
+    assert.deepEqual(Object.keys(models), allExpected);
+    assert.equal(calls.filter(c => c.url.endsWith("/credentials")).length, 0, "breaker already tripped by definitions");
+    const quota = await instance.auth.usage(() => auth());
+    assert.match(quota.error, /management access rejected/);
+  }
+
+  // 5) Slow usage/profile check times out at the models() wait cap and fails open without failing discovery.
+  {
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeoutArgs = [];
+    t.mock.method(AbortSignal, "timeout", ms => {
+      timeoutArgs.push(ms);
+      return realTimeout(ms === 5_000 ? 25 : ms);
+    });
+    let release;
+    let apiCalled = false;
+    const gate = new Promise(resolve => { release = resolve; });
+    mockDiscoveryFetch(t, {
+      onFetch: async url => {
+        if (url.endsWith("/requests/api-call")) { apiCalled = true; await gate; }
+      },
+    });
+    const instance = await plugin();
+    const alive = setTimeout(() => {}, 1000);
+    try {
+      const models = await instance.provider.models({}, { auth: auth() });
+      assert.deepEqual(Object.keys(models), allExpected, "timed-out usage check must fail open");
+      assert.equal(apiCalled, true, "usage check must actually run before timing out");
+      assert.ok(timeoutArgs.includes(5_000), "models() must cap Fable wait at 5000ms");
+      // Once the shared in-flight read completes in the background, the next models() sees the warm cache.
+      release();
+      await new Promise(resolve => setTimeout(resolve, 25));
+      const next = await instance.provider.models({}, { auth: auth() });
+      assert.deepEqual(Object.keys(next), ["claude-sonnet-4-6"]);
+    } finally {
+      release();
+      clearTimeout(alive);
+    }
+  }
+
+  // 6) Aborted caller signal during Fable check fails open instead of failing discovery.
+  {
+    const controller = new AbortController();
+    let release;
+    let apiCalled = false;
+    const gate = new Promise(resolve => { release = resolve; });
+    mockDiscoveryFetch(t, {
+      onFetch: async url => {
+        if (url.endsWith("/requests/api-call")) {
+          apiCalled = true;
+          controller.abort(new DOMException("cancelled", "AbortError"));
+          await gate;
+        }
+      },
+    });
+    const instance = await plugin();
+    try {
+      const models = await instance.provider.models({}, { auth: auth(), signal: controller.signal });
+      assert.deepEqual(Object.keys(models), allExpected);
+      assert.equal(apiCalled, true);
+    } finally {
+      release();
+    }
+  }
 });

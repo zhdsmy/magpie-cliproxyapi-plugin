@@ -103,6 +103,10 @@ function claudePlan(profile) {
   if (type === "claude_enterprise") return "Enterprise";
 }
 
+function isFableModel(id) {
+  return typeof id === "string" && id.toLowerCase().includes("fable");
+}
+
 // Model-scoped weekly limits (e.g. Fable's own week), named and scoped as Magpie's built-in Claude
 // names them: "7 days · Fable" counting models whose id contains "fable"; "Fable 5.1" → "fable-5-1".
 function claudeScopedWindows(data, plan) {
@@ -122,18 +126,20 @@ function claudeScopedWindows(data, plan) {
   for (const limit of rawLimits) {
     if (limit?.kind === "weekly_scoped") add(limit.scope?.model?.display_name, limit.percent, limit.resets_at);
   }
-  // Fable is granted per account (Pro gets it only now and then). Infer "Not in plan" only when
+  // Fable is granted per account (Pro gets it only now and then). Confirm exclusion only when
   // the profile confirmed Pro, `limits` carries the standard session/weekly entries, and no raw
-  // weekly_scoped limit mentions Fable (so a parse failure never falsely blocks a Fable-capable account).
+  // weekly_scoped limit mentions Fable (so a parse failure never falsely drops Fable).
+  // Emit a display-only text window (no used/span/model) so Magpie excludes it from summary rows;
+  // Fable routing avoidance is handled per account in provider.models.
   const told = rawLimits.some(limit => ["session", "weekly_all"].includes(limit?.kind));
-  const hasFable = windows.some(window => window.model.includes("fable")) ||
+  const hasFable = windows.some(window => isFableModel(window.model)) ||
     rawLimits.some(limit => limit?.kind === "weekly_scoped" &&
-      [limit.scope?.model?.display_name, limit.scope?.model?.id]
-        .some(value => typeof value === "string" && value.toLowerCase().includes("fable")));
-  if (plan === "Pro" && told && !hasFable) {
-    windows.push({ name: "7 days · Fable", used: 100, span: 604800, model: "fable", display: "Not in plan" });
+      [limit.scope?.model?.display_name, limit.scope?.model?.id].some(isFableModel));
+  const fableExcluded = plan === "Pro" && told && !hasFable;
+  if (fableExcluded) {
+    windows.push({ name: "7 days · Fable", display: "Not in plan", aside: true });
   }
-  return windows;
+  return { windows, fableExcluded };
 }
 
 // Paid usage past the plan, shown only while it is on; display only, so it never moves routing.
@@ -201,10 +207,10 @@ async function readClaudeUsage(apiCall, _credential, { now, memo = {} }) {
   }
   const baseWindows = usageWindows(data);
   await readClaudeProfile(apiCall, now, memo);
-  const extraWindows = claudeScopedWindows(data, memo.plan);
+  const { windows: extraWindows, fableExcluded } = claudeScopedWindows(data, memo.plan);
   const credits = claudeCreditsWindow(data);
   if (credits) extraWindows.push(credits);
-  const reading = { windows: [...baseWindows, ...extraWindows], extraWindows, inventory };
+  const reading = { windows: [...baseWindows, ...extraWindows], extraWindows, inventory, fableExcluded };
   const resets = claudeResets(data?.cedar_ember, now);
   if (resets) reading.resets = resets;
   if (memo.plan) reading.plan = memo.plan;
@@ -242,6 +248,7 @@ async function readClaudeProfile(apiCall, now, memo) {
 const readTTL = 300_000;
 const inventoryTTL = 1_800_000;
 const signalMaxAge = 300_000;
+const fableWaitMs = 5_000;
 
 // Anthropic's unified rate-limit headers, which CPA keeps per credential from its latest real
 // inference response (`quota.signals` in /credentials). Utilization is a 0-1 share and reset a
@@ -440,247 +447,293 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
   const activeReads = new Map(); // per management scope: at most two upstream credential reads
   const render = entry => entry.value && (!entry.error || now() - entry.updatedAt <= 900_000)
     ? entry.value : { error: entry.error, signIn: "kept" };
-  return async getAuth => {
-    try {
-      const startedAt = now();
-      const signal = timeout(15_000);
-      const auth = await within(Promise.resolve().then(getAuth), signal);
-      const metadata = auth?.metadata;
-      if (auth?.type !== "api" || !metadata?.managementKey) return {};
-      if (typeof metadata.managementKey !== "string") throw new UsageError("Check the CPA management key");
-      const base = managementBase(metadata);
-      const selection = metadata.credential ?? "";
-      if (typeof selection !== "string") throw new UsageError("Check the CPA credential selection");
-      const scope = managementScope(base, metadata);
-      if (blocked.has(scope)) return { error: blocked.get(scope), signIn: "kept" };
-      const modelRouting = metadata.modelRouting === "enabled";
-      const key = JSON.stringify([scope, selection, modelRouting]);
-      let entry = cache.get(key);
-      if (!entry) { entry = {}; cache.set(key, entry); }
-      if (entry.pending) return await within(entry.pending, signal);
-      if (entry.value && now() - entry.updatedAt < readTTL || now() < entry.retryAt) return render(entry);
-      const call = (path, maxBytes, body, optionalMs) => {
-        // Leave time to return valid windows if the optional inventory endpoint stalls.
-        if (optionalMs) {
-          optionalMs = Math.min(optionalMs, 14_000 - (now() - startedAt));
-          if (optionalMs <= 0) throw new UsageError("Optional CPA inventory budget exhausted");
-        }
-        const requestSignal = optionalMs ? AbortSignal.any([signal, timeout(optionalMs)]) : signal;
-        return within((async () => {
-          requestSignal.throwIfAborted();
-          if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
-          const response = await request(base + path, {
-            method: body === undefined ? "GET" : "POST",
-            headers: managementHeaders(metadata),
-            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-            redirect: "error", signal: requestSignal,
-          });
-          if (response.status !== 200) {
-            const permanent = [401, 403].includes(response.status);
-            const message = permanent ? "CPA management access rejected; check key and remote access"
-              : "CPA management request failed (HTTP " + response.status + "); retry later";
-            if (permanent) blocked.set(scope, message);
-            try { await response.body?.cancel(); } catch {}
-            throw new UsageError(message, { permanent });
-          }
-          return readJSON(response, maxBytes);
-        })(), requestSignal);
-      };
-      const limited = async read => {
-        let release;
-        const active = activeReads.get(scope) ?? new Set();
-        activeReads.set(scope, active);
-        while (active.size >= 2) await within(Promise.race(active), signal);
-        signal.throwIfAborted();
+  const readEntry = async getAuth => {
+    const startedAt = now();
+    const signal = timeout(15_000);
+    const auth = await within(Promise.resolve().then(getAuth), signal);
+    const metadata = auth?.metadata;
+    if (auth?.type !== "api" || !metadata?.managementKey) return { empty: true };
+    if (typeof metadata.managementKey !== "string") throw new UsageError("Check the CPA management key");
+    const base = managementBase(metadata);
+    const selection = metadata.credential ?? "";
+    if (typeof selection !== "string") throw new UsageError("Check the CPA credential selection");
+    const scope = managementScope(base, metadata);
+    if (blocked.has(scope)) return { blocked: blocked.get(scope) };
+    const modelRouting = metadata.modelRouting === "enabled";
+    const key = JSON.stringify([scope, selection, modelRouting]);
+    let entry = cache.get(key);
+    if (!entry) { entry = {}; cache.set(key, entry); }
+    if (entry.pending) {
+      await within(entry.pending, signal);
+      return { entry };
+    }
+    if (entry.value && now() - entry.updatedAt < readTTL || now() < entry.retryAt) return { entry };
+    const call = (path, maxBytes, body, optionalMs) => {
+      // Leave time to return valid windows if the optional inventory endpoint stalls.
+      if (optionalMs) {
+        optionalMs = Math.min(optionalMs, 14_000 - (now() - startedAt));
+        if (optionalMs <= 0) throw new UsageError("Optional CPA inventory budget exhausted");
+      }
+      const requestSignal = optionalMs ? AbortSignal.any([signal, timeout(optionalMs)]) : signal;
+      return within((async () => {
+        requestSignal.throwIfAborted();
         if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
-        const slot = new Promise(resolve => { release = resolve; });
-        active.add(slot);
-        try { return await read(); }
-        finally { active.delete(slot); release(); }
-      };
-      // Accounts on one CPA refreshed together share a single credential list.
-      const credentialList = () => {
-        let list = lists.get(scope);
-        if (!list || now() - list.at >= 15_000) {
-          list = { at: now(), files: call("/credentials", 1 << 20).then(credentials => {
-            if (!Array.isArray(credentials?.files)) throw new UsageError("Invalid CPA credential list", { stale: false });
-            return credentials.files;
-          }) };
-          lists.set(scope, list);
-          list.files.catch(() => { if (lists.get(scope) === list) lists.delete(scope); });
+        const response = await request(base + path, {
+          method: body === undefined ? "GET" : "POST",
+          headers: managementHeaders(metadata),
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          redirect: "error", signal: requestSignal,
+        });
+        if (response.status !== 200) {
+          const permanent = [401, 403].includes(response.status);
+          const message = permanent ? "CPA management access rejected; check key and remote access"
+            : "CPA management request failed (HTTP " + response.status + "); retry later";
+          if (permanent) blocked.set(scope, message);
+          try { await response.body?.cancel(); } catch {}
+          throw new UsageError(message, { permanent });
         }
-        return within(list.files, signal);
-      };
-      // Upstream reads are cached per credential, so every selection naming it shares one reading,
-      // one in-flight request and one backoff. CPA's passive signals supply the windows when they
-      // are recent; the reset inventory then needs a fresh read only every 30 minutes.
-      const credentialReading = async (credential, adapter, apiCall) => {
-        const upstreamKey = JSON.stringify([scope, credential.auth_index]);
-        let state = upstream.get(upstreamKey);
-        if (!state) { state = { memo: {}, failures: 0, retryAt: 0 }; upstream.set(upstreamKey, state); }
-        const t = now();
-        const passive = adapter.passive?.(credential, t);
-        const last = state.reading;
-        const age = last ? t - state.readAt : Infinity;
-        const inventoryAge = last ? t - (last.inventoryAt ?? state.readAt) : Infinity;
-        // Passive signals carry only the 5-hour and 7-day pair, so the last read's other windows
-        // (a model's own week, usage credits) stay beside them until the next read, dropping any
-        // whose reset time has already passed.
-        const liveExtra = () => (last?.extraWindows ?? []).filter(window => !window.resetsAt || Date.parse(window.resetsAt) > t);
-        const fromPassive = () => ({ windows: [...passive.windows, ...liveExtra()],
-          plan: passive.plan ?? last?.plan, until: liveUntil(last?.until, t),
-          resets: inventoryAge < inventoryTTL ? liveResets(last?.resets, t) : undefined });
-        if (age < readTTL) {
-          return passive && passive.observedAt > state.readAt ? fromPassive()
-            : { windows: last.windows, plan: last.plan, until: liveUntil(last.until, t), resets: liveResets(last.resets, t) };
-        }
-        // Even in plain mode (cedar_ember refused), re-read every 30 minutes while extra windows
-        // (such as Fable's week or "Not in plan") are present, and once a day when the profile is due.
-        const profileDue = credential.provider === "claude" && state.memo.profileDueAt <= t;
-        const staleSide = (last?.inventory || last?.extraWindows?.length) && inventoryAge >= inventoryTTL;
-        if (passive && (passive.inventory === false || last && !staleSide && !profileDue)) return fromPassive();
-        if (!state.pending && t < state.retryAt) {
-          if (passive) return fromPassive();
-          throw state.error;
-        }
-        state.pending ??= (async () => {
-          try {
-            const reading = await limited(() => adapter.read(apiCall, credential, { now: t, memo: state.memo,
-              passive: passive && { ...passive, plan: passive.plan ?? last?.plan } }));
-            Object.assign(state, { reading, readAt: now(), failures: 0, retryAt: 0, error: undefined });
-            return reading;
-          } catch (error) {
-            state.failures++;
-            state.error = error instanceof UsageError ? error : new UsageError("CPA upstream usage request failed; retry later");
-            state.retryAt = now() + upstreamDelay(error, state.failures);
-            throw error;
-          } finally {
-            state.pending = undefined;
-          }
-        })();
+        return readJSON(response, maxBytes);
+      })(), requestSignal);
+    };
+    const limited = async read => {
+      let release;
+      const active = activeReads.get(scope) ?? new Set();
+      activeReads.set(scope, active);
+      while (active.size >= 2) await within(Promise.race(active), signal);
+      signal.throwIfAborted();
+      if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
+      const slot = new Promise(resolve => { release = resolve; });
+      active.add(slot);
+      try { return await read(); }
+      finally { active.delete(slot); release(); }
+    };
+    // Accounts on one CPA refreshed together share a single credential list.
+    const credentialList = () => {
+      let list = lists.get(scope);
+      if (!list || now() - list.at >= 15_000) {
+        list = { at: now(), files: call("/credentials", 1 << 20).then(credentials => {
+          if (!Array.isArray(credentials?.files)) throw new UsageError("Invalid CPA credential list", { stale: false });
+          return credentials.files;
+        }) };
+        lists.set(scope, list);
+        list.files.catch(() => { if (lists.get(scope) === list) lists.delete(scope); });
+      }
+      return within(list.files, signal);
+    };
+    // Upstream reads are cached per credential, so every selection naming it shares one reading,
+    // one in-flight request and one backoff. CPA's passive signals supply the windows when they
+    // are recent; the reset inventory then needs a fresh read only every 30 minutes.
+    const credentialReading = async (credential, adapter, apiCall) => {
+      const upstreamKey = JSON.stringify([scope, credential.auth_index]);
+      let state = upstream.get(upstreamKey);
+      if (!state) { state = { memo: {}, failures: 0, retryAt: 0 }; upstream.set(upstreamKey, state); }
+      const t = now();
+      const passive = adapter.passive?.(credential, t);
+      const last = state.reading;
+      const age = last ? t - state.readAt : Infinity;
+      const inventoryAge = last ? t - (last.inventoryAt ?? state.readAt) : Infinity;
+      // Passive signals carry only the 5-hour and 7-day pair, so the last read's other windows
+      // (a model's own week, usage credits) stay beside them until the next read, dropping any
+      // whose reset time has already passed.
+      const liveExtra = () => (last?.extraWindows ?? []).filter(window => !window.resetsAt || Date.parse(window.resetsAt) > t);
+      const fromPassive = (confirmed = true) => ({
+        windows: [...passive.windows, ...liveExtra()],
+        plan: passive.plan ?? last?.plan, until: liveUntil(last?.until, t),
+        resets: inventoryAge < inventoryTTL ? liveResets(last?.resets, t) : undefined,
+        fableExcluded: confirmed && Boolean(last?.fableExcluded),
+      });
+      if (age < readTTL) {
+        return passive && passive.observedAt > state.readAt ? fromPassive()
+          : { windows: last.windows, plan: last.plan, until: liveUntil(last.until, t),
+            resets: liveResets(last.resets, t), fableExcluded: Boolean(last.fableExcluded) };
+      }
+      // Even in plain mode (cedar_ember refused), re-read every 30 minutes while extra windows
+      // (such as Fable's week or "Not in plan") are present, and once a day when the profile is due.
+      const profileDue = credential.provider === "claude" && state.memo.profileDueAt <= t;
+      const staleSide = (last?.inventory || last?.extraWindows?.length) && inventoryAge >= inventoryTTL;
+      if (passive && (passive.inventory === false || last && !staleSide && !profileDue)) return fromPassive();
+      if (!state.pending && t < state.retryAt) {
+        if (passive) return fromPassive(false);
+        throw state.error;
+      }
+      state.pending ??= (async () => {
         try {
-          const reading = await within(state.pending, signal);
-          return { windows: reading.windows, plan: reading.plan, until: liveUntil(reading.until, now()),
-            resets: liveResets(reading.resets, now()) };
+          const reading = await limited(() => adapter.read(apiCall, credential, { now: t, memo: state.memo,
+            passive: passive && { ...passive, plan: passive.plan ?? last?.plan } }));
+          Object.assign(state, { reading, readAt: now(), failures: 0, retryAt: 0, error: undefined });
+          return reading;
         } catch (error) {
-          if (error?.permanent) throw error;
-          if (passive) return fromPassive();
+          state.failures++;
+          state.error = error instanceof UsageError ? error : new UsageError("CPA upstream usage request failed; retry later");
+          state.retryAt = now() + upstreamDelay(error, state.failures);
           throw error;
+        } finally {
+          state.pending = undefined;
         }
-      };
-      entry.pending = (async () => {
-        try {
-          const files = await credentialList();
-          const rows = files.filter(row => row?.disabled === false);
-          const supported = row => Object.hasOwn(adapters, row.provider);
-          const matches = selection ? rows.filter(row => row.auth_index === selection || row.name === selection)
-            : rows.filter(supported);
-          if (!matches.length) throw new UsageError(selection ? "Selected CPA credential is missing or disabled"
-            : rows.length ? "Quota is not supported for this provider yet" : "No enabled CPA credential found", { stale: false });
-          if (selection && matches.length !== 1) throw new UsageError("Multiple CPA credentials; choose a unique name or auth_index", { stale: false });
-          if (rows.length > 1 && entry.value?.windows.some(window => !window.aside)) entry.value = undefined;
-          matches.sort((a, b) => a.provider.localeCompare(b.provider) || credentialLabel(a).localeCompare(credentialLabel(b)) ||
-            String(a.auth_index).localeCompare(String(b.auth_index)));
-          let exclusive;
-          if (modelRouting && !selection && rows.length > 1 && rows.every(supported)) {
-            const list = lists.get(scope);
-            list.models ??= Promise.all(rows.map(credential => limited(async () => {
-              const name = credential.name || credential.id;
-              if (typeof name !== "string" || !name.trim()) throw new UsageError("Missing CPA credential name or ID");
-              const payload = await call("/credentials/models?name=" + encodeURIComponent(name), 1 << 20);
-              if (!Array.isArray(payload?.models) || payload.models.some(model => typeof model?.id !== "string" || !model.id.trim())) {
-                throw new UsageError("Invalid CPA credential model list");
-              }
-              return new Set(payload.models.map(model => model.id.toLowerCase()));
-            })));
-            try {
-              const sets = await within(list.models, signal);
-              exclusive = new Map(rows.map((credential, index) => [credential.auth_index,
-                [...sets[index]].filter(id => sets.every((set, other) => other === index || !set.has(id)))]));
-            } catch (error) {
-              if (error?.permanent || blocked.has(scope)) throw error;
-              // Any unknown membership leaves the entire pool display-only for this list's 15s lifetime.
-            }
-          }
-          const read = async credential => {
-            if (!supported(credential)) throw new UsageError("Quota is not supported for this provider yet", { stale: false });
-            const adapter = adapters[credential.provider];
-            if (typeof credential.auth_index !== "string" || !credential.auth_index.trim() || credential.auth_index.length > 128) {
-              throw new UsageError("Invalid CPA auth_index; check the selected credential", { stale: false });
-            }
-            const apiCall = async (template, optionalMs) => {
-              const payload = await call("/requests/api-call", 256 << 10, {
-                ...template, auth_index: credential.auth_index,
-              }, optionalMs);
-              if (payload?.status_code !== 200) {
-                const status = payload?.status_code;
-                const error = new UsageError(status === 401 ? "CPA upstream credential rejected; refresh it in CPA"
-                  : status === 429 ? "CPA upstream usage request rate-limited; retry later"
-                    : "CPA upstream usage request failed; retry later");
-                error.upstreamStatus = status;
-                error.retryAfter = retryAfter(payload?.header, now());
-                throw error;
-              }
-              if (typeof payload.body !== "string") throw new UsageError("Invalid CPA usage response");
-              return JSON.parse(payload.body);
-            };
-            return credentialReading(credential, adapter, apiCall);
-          };
-          const readings = await Promise.all(matches.map(async credential => {
-            try {
-              if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
-              signal.throwIfAborted();
-              return { reading: await read(credential) };
-            } catch (error) {
-              if (error?.permanent || blocked.has(scope)) throw new UsageError(blocked.get(scope) ?? error.message, { permanent: true });
-              return { error };
-            }
-          }));
-          if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
-          const successes = readings.filter(result => result.reading);
-          if (!successes.length) throw readings[0].error;
-          // Copies, so labels never alter the readings other selections share.
-          const windows = readings.flatMap(({ reading, error }, index) => {
-            const label = credentialLabel(matches[index]);
-            if (error) return [{ name: label, display: "Quota unavailable; check credential in CPA", aside: true }];
-            const models = exclusive?.get(matches[index].auth_index);
-            return reading.windows.map(window => {
-              if (rows.length <= 1) return { ...window };
-              const named = { ...window, name: window.name + " (" + label + ")" };
-              if (window.aside) return named;
-              // A model's own week counts only its models among the credential's exclusive ones.
-              const counted = window.model ? models?.filter(id => id.includes(window.model)) : models;
-              return { ...named, ...(counted?.length ? { models: counted } : { aside: true }) };
-            });
-          });
-          entry.value = { windows, signIn: "kept" };
-          if (matches.length === 1) {
-            const reading = successes[0].reading;
-            if (reading.resets) entry.value.resets = reading.resets;
-            if (reading.plan) entry.value.plan = reading.plan;
-            if (reading.until) entry.value.until = reading.until;
-          } else {
-            const plan = poolPlan(readings.map(({ reading }, index) => {
-              const cached = upstream.get(JSON.stringify([scope, matches[index].auth_index]));
-              return { provider: matches[index].provider, plan: reading?.plan ?? cached?.reading?.plan ?? cached?.memo?.plan };
-            }));
-            if (plan) entry.value.plan = plan;
-          }
-          entry.updatedAt = now();
-          entry.error = undefined;
-        } catch (error) {
-          entry.error = error instanceof UsageError ? error.message : signal.aborted
-            ? "CPA usage timed out; check management access" : "CPA usage unavailable; check management access";
-          if (error instanceof UsageError && (!error.stale || error.permanent)) entry.value = undefined;
-          entry.retryAt = now() + readTTL;
-        } finally { entry.pending = undefined; }
-        return render(entry);
       })();
-      return await within(entry.pending, signal);
+      try {
+        const reading = await within(state.pending, signal);
+        return { windows: reading.windows, plan: reading.plan, until: liveUntil(reading.until, now()),
+          resets: liveResets(reading.resets, now()), fableExcluded: Boolean(reading.fableExcluded) };
+      } catch (error) {
+        if (error?.permanent) throw error;
+        if (passive) return fromPassive(false);
+        throw error;
+      }
+    };
+    entry.pending = (async () => {
+      try {
+        const files = await credentialList();
+        const rows = files.filter(row => row?.disabled === false);
+        const supported = row => Object.hasOwn(adapters, row.provider);
+        const matches = selection ? rows.filter(row => row.auth_index === selection || row.name === selection)
+          : rows.filter(supported);
+        if (!matches.length) throw new UsageError(selection ? "Selected CPA credential is missing or disabled"
+          : rows.length ? "Quota is not supported for this provider yet" : "No enabled CPA credential found", { stale: false });
+        if (selection && matches.length !== 1) throw new UsageError("Multiple CPA credentials; choose a unique name or auth_index", { stale: false });
+        if (rows.length > 1 && entry.value?.windows.some(window => !window.aside)) entry.value = undefined;
+        matches.sort((a, b) => a.provider.localeCompare(b.provider) || credentialLabel(a).localeCompare(credentialLabel(b)) ||
+          String(a.auth_index).localeCompare(String(b.auth_index)));
+        let exclusive;
+        if (modelRouting && !selection && rows.length > 1 && rows.every(supported)) {
+          const list = lists.get(scope);
+          list.models ??= Promise.all(rows.map(credential => limited(async () => {
+            const name = credential.name || credential.id;
+            if (typeof name !== "string" || !name.trim()) throw new UsageError("Missing CPA credential name or ID");
+            const payload = await call("/credentials/models?name=" + encodeURIComponent(name), 1 << 20);
+            if (!Array.isArray(payload?.models) || payload.models.some(model => typeof model?.id !== "string" || !model.id.trim())) {
+              throw new UsageError("Invalid CPA credential model list");
+            }
+            return new Set(payload.models.map(model => model.id.toLowerCase()));
+          })));
+          try {
+            const sets = await within(list.models, signal);
+            exclusive = new Map(rows.map((credential, index) => [credential.auth_index,
+              [...sets[index]].filter(id => sets.every((set, other) => other === index || !set.has(id)))]));
+          } catch (error) {
+            if (error?.permanent || blocked.has(scope)) throw error;
+            // Any unknown membership leaves the entire pool display-only for this list's 15s lifetime.
+          }
+        }
+        const read = async credential => {
+          if (!supported(credential)) throw new UsageError("Quota is not supported for this provider yet", { stale: false });
+          const adapter = adapters[credential.provider];
+          if (typeof credential.auth_index !== "string" || !credential.auth_index.trim() || credential.auth_index.length > 128) {
+            throw new UsageError("Invalid CPA auth_index; check the selected credential", { stale: false });
+          }
+          const apiCall = async (template, optionalMs) => {
+            const payload = await call("/requests/api-call", 256 << 10, {
+              ...template, auth_index: credential.auth_index,
+            }, optionalMs);
+            if (payload?.status_code !== 200) {
+              const status = payload?.status_code;
+              const error = new UsageError(status === 401 ? "CPA upstream credential rejected; refresh it in CPA"
+                : status === 429 ? "CPA upstream usage request rate-limited; retry later"
+                  : "CPA upstream usage request failed; retry later");
+              error.upstreamStatus = status;
+              error.retryAfter = retryAfter(payload?.header, now());
+              throw error;
+            }
+            if (typeof payload.body !== "string") throw new UsageError("Invalid CPA usage response");
+            return JSON.parse(payload.body);
+          };
+          return credentialReading(credential, adapter, apiCall);
+        };
+        const readings = await Promise.all(matches.map(async credential => {
+          try {
+            if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
+            signal.throwIfAborted();
+            return { reading: await read(credential) };
+          } catch (error) {
+            if (error?.permanent || blocked.has(scope)) throw new UsageError(blocked.get(scope) ?? error.message, { permanent: true });
+            return { error };
+          }
+        }));
+        if (blocked.has(scope)) throw new UsageError(blocked.get(scope), { permanent: true });
+        const successes = readings.filter(result => result.reading);
+        if (!successes.length) throw readings[0].error;
+        // Copies, so labels never alter the readings other selections share.
+        const windows = readings.flatMap(({ reading, error }, index) => {
+          const label = credentialLabel(matches[index]);
+          if (error) return [{ name: label, display: "Quota unavailable; check credential in CPA", aside: true }];
+          const models = exclusive?.get(matches[index].auth_index);
+          return reading.windows.map(window => {
+            if (rows.length <= 1) return { ...window };
+            const named = { ...window, name: window.name + " (" + label + ")" };
+            if (window.aside) return named;
+            // A model's own week counts only its models among the credential's exclusive ones.
+            const counted = window.model ? models?.filter(id => id.includes(window.model)) : models;
+            return { ...named, ...(counted?.length ? { models: counted } : { aside: true }) };
+          });
+        });
+        entry.value = { windows, signIn: "kept" };
+        if (matches.length === 1) {
+          const reading = successes[0].reading;
+          if (reading.resets) entry.value.resets = reading.resets;
+          if (reading.plan) entry.value.plan = reading.plan;
+          if (reading.until) entry.value.until = reading.until;
+        } else {
+          const plan = poolPlan(readings.map(({ reading }, index) => {
+            const cached = upstream.get(JSON.stringify([scope, matches[index].auth_index]));
+            return { provider: matches[index].provider, plan: reading?.plan ?? cached?.reading?.plan ?? cached?.memo?.plan };
+          }));
+          if (plan) entry.value.plan = plan;
+        }
+        // Only exclude Fable when EVERY enabled credential on this CPA is covered and confirmed Pro without Fable.
+        entry.fableExcluded = matches.length === rows.length &&
+          readings.every((result, index) => matches[index].provider === "claude" && result.reading?.fableExcluded === true);
+        entry.updatedAt = now();
+        entry.error = undefined;
+      } catch (error) {
+        entry.error = error instanceof UsageError ? error.message : signal.aborted
+          ? "CPA usage timed out; check management access" : "CPA usage unavailable; check management access";
+        entry.fableExcluded = false;
+        if (error instanceof UsageError && (!error.stale || error.permanent)) entry.value = undefined;
+        entry.retryAt = now() + readTTL;
+      } finally { entry.pending = undefined; }
+      return entry;
+    })();
+    await within(entry.pending, signal);
+    return { entry };
+  };
+  const usage = async getAuth => {
+    try {
+      const result = await readEntry(getAuth);
+      if (result.empty) return {};
+      if (result.blocked) return { error: result.blocked, signIn: "kept" };
+      return render(result.entry);
     } catch {
       return { error: "CPA usage unavailable; check management configuration", signIn: "kept" };
     }
   };
+  // Shared per-account Fable entitlement check for provider.models: reuses the exact same cache,
+  // single-flight reads, backoff and 15s budget, bounded by fableWaitMs and failing open on any uncertainty.
+  usage.fableExcluded = async (auth, callerSignal) => {
+    try {
+      const metadata = auth?.metadata;
+      if (auth?.type !== "api" || typeof metadata?.managementKey !== "string" || !metadata.managementKey) return false;
+      const base = managementBase(metadata);
+      const selection = metadata.credential ?? "";
+      if (typeof selection !== "string") return false;
+      const scope = managementScope(base, metadata);
+      if (blocked.has(scope)) return false;
+      const key = JSON.stringify([scope, selection, metadata.modelRouting === "enabled"]);
+      const cached = cache.get(key);
+      if (cached && !cached.pending && (cached.value && now() - cached.updatedAt < readTTL || now() < cached.retryAt)) {
+        return !cached.error && cached.fableExcluded === true;
+      }
+      if (callerSignal?.aborted) return false;
+      const budget = timeout(fableWaitMs);
+      const waitSignal = callerSignal ? AbortSignal.any([callerSignal, budget]) : budget;
+      const pending = readEntry(() => auth);
+      pending.catch(() => {});
+      const result = await within(pending, waitSignal);
+      return Boolean(result.entry && !result.entry.error && result.entry.fableExcluded === true);
+    } catch {
+      return false;
+    }
+  };
+  return usage;
 }
 
 function definitionBase(id) {
@@ -697,14 +750,15 @@ function reasoningLevels(definition) {
 
 // Management 401/403 counts toward CPA's per-IP ban (5 failures, 30 minutes), so discovery
 // shares the usage hook's rejection breaker instead of retrying a rejected key on every refresh.
-async function modelDefinitions(auth, blocked = new Map(), channel = "claude") {
+async function modelDefinitions(auth, blocked = new Map(), channel = "claude", callerSignal) {
   const metadata = auth?.metadata;
   if (typeof metadata?.managementKey !== "string" || !metadata.managementKey) return new Map();
   try {
     const base = managementBase(metadata);
     const scope = managementScope(base, metadata);
     if (blocked.has(scope)) return new Map();
-    const signal = AbortSignal.timeout(10_000);
+    const timeoutSignal = AbortSignal.timeout(10_000);
+    const signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
     const response = await fetch(base + "/routing/model-definitions/" + channel, {
       headers: managementHeaders(metadata), signal, redirect: "error",
     });
@@ -742,6 +796,7 @@ function applyReasoning(model, definition, configured) {
 
 export default async function CLIProxyAPIPlugin() {
   const rejectedManagement = new Map();
+  const usage = createUsage({ blocked: rejectedManagement });
   return {
     async config(cfg) {
       cfg.provider ??= {};
@@ -749,7 +804,7 @@ export default async function CLIProxyAPIPlugin() {
     },
     auth: {
       provider: "cpa",
-      usage: createUsage({ blocked: rejectedManagement }),
+      usage,
       methods: [{
         type: "api",
         label: "CLIProxyAPI business API key",
@@ -798,12 +853,13 @@ export default async function CLIProxyAPIPlugin() {
     },
     provider: {
       id: "cpa",
-      async models(provider, { auth } = {}) {
+      async models(provider, { auth, signal: callerSignal } = {}) {
         if (auth?.type !== "api" || !auth.key) return {};
         const baseURL = normalizeURL(auth.metadata?.baseURL);
-        const definitionsPromise = modelDefinitions(auth, rejectedManagement);
-        const codexDefinitionsPromise = modelDefinitions(auth, rejectedManagement, "codex");
-        const signal = AbortSignal.timeout(10_000);
+        const definitionsPromise = modelDefinitions(auth, rejectedManagement, "claude", callerSignal);
+        const codexDefinitionsPromise = modelDefinitions(auth, rejectedManagement, "codex", callerSignal);
+        const timeoutSignal = AbortSignal.timeout(10_000);
+        const signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
         const fetchModels = async headers => {
           const response = await fetch(baseURL + "/v1/models", { headers, signal, redirect: "error" });
           if (!response.ok) {
@@ -852,6 +908,11 @@ export default async function CLIProxyAPIPlugin() {
           }
           if (codex) model.api = { ...model.api, npm: "@ai-sdk/openai" };
           Object.defineProperty(models, row.id, { value: model, enumerable: true, configurable: true, writable: true });
+        }
+        if (Object.keys(models).some(isFableModel) && await usage.fableExcluded(auth, callerSignal)) {
+          for (const id of Object.keys(models)) {
+            if (isFableModel(id)) delete models[id];
+          }
         }
         return models;
       },
