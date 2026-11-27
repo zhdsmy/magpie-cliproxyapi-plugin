@@ -709,26 +709,14 @@ function createUsage({ request = (...args) => fetch(...args), now = () => Date.n
   // Shared per-account Fable entitlement check for provider.models: reuses the exact same cache,
   // single-flight reads, backoff and 15s budget, bounded by fableWaitMs and failing open on any uncertainty.
   usage.fableExcluded = async (auth, callerSignal) => {
+    if (callerSignal?.aborted) return false;
     try {
-      const metadata = auth?.metadata;
-      if (auth?.type !== "api" || typeof metadata?.managementKey !== "string" || !metadata.managementKey) return false;
-      const base = managementBase(metadata);
-      const selection = metadata.credential ?? "";
-      if (typeof selection !== "string") return false;
-      const scope = managementScope(base, metadata);
-      if (blocked.has(scope)) return false;
-      const key = JSON.stringify([scope, selection, metadata.modelRouting === "enabled"]);
-      const cached = cache.get(key);
-      if (cached && !cached.pending && (cached.value && now() - cached.updatedAt < readTTL || now() < cached.retryAt)) {
-        return !cached.error && cached.fableExcluded === true;
-      }
-      if (callerSignal?.aborted) return false;
       const budget = timeout(fableWaitMs);
       const waitSignal = callerSignal ? AbortSignal.any([callerSignal, budget]) : budget;
       const pending = readEntry(() => auth);
       pending.catch(() => {});
-      const result = await within(pending, waitSignal);
-      return Boolean(result.entry && !result.entry.error && result.entry.fableExcluded === true);
+      const { entry } = await within(pending, waitSignal);
+      return Boolean(entry && !entry.error && entry.fableExcluded === true);
     } catch {
       return false;
     }
